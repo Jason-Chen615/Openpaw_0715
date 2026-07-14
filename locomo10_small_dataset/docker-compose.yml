@@ -1,0 +1,59 @@
+version: '3.8'
+
+# LoCoMo × QwenPaw 服务器部署配置
+# 用法：docker compose up -d
+# 配置说明见 DEPLOYMENT.md
+
+volumes:
+  qwenpaw-data:
+    name: qwenpaw-data
+  qwenpaw-secrets:
+    name: qwenpaw-secrets
+  qwenpaw-backups:
+    name: qwenpaw-backups
+
+services:
+  qwenpaw:
+    image: agentscope/qwenpaw:latest
+    init: true
+    container_name: qwenpaw
+    restart: always
+    ports:
+      # 只绑定本机回环地址，通过 Nginx 反代对外暴露，避免直接公网暴露
+      - "127.0.0.1:8088:8088"
+    environment:
+      # ── 认证（服务器部署必须开启）──────────────────────────────
+      - QWENPAW_AUTH_ENABLED=true
+      - QWENPAW_AUTH_USERNAME=${QWENPAW_AUTH_USERNAME:-admin}
+      - QWENPAW_AUTH_PASSWORD=${QWENPAW_AUTH_PASSWORD:-changeme_strong_password}
+
+      # ── 模型 API Key（按需填写其中一项）──────────────────────────
+      # DashScope / 通义千问
+      - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY:-}
+      # OpenAI
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      # Anthropic
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      # DeepSeek
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+
+      # ── 可选：修改服务端口 ────────────────────────────────────────
+      # - QWENPAW_PORT=8088
+
+    volumes:
+      - qwenpaw-data:/app/working
+      - qwenpaw-secrets:/app/working.secret
+      - qwenpaw-backups:/app/working.backups
+      # 挂载数据集和评测脚本（只读）
+      - ./locomo_small.json:/app/eval/locomo_small.json:ro
+      - ./eval_locomo.py:/app/eval/eval_locomo.py:ro
+      # 评测结果输出目录（可写）
+      - ./eval_results:/app/eval_results
+
+    # 健康检查：确认 API 可用后才标记为 healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8088/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s

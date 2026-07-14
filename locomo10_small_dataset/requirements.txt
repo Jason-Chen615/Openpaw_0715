@@ -1,0 +1,9 @@
+# LoCoMo 评测脚本依赖
+# 用途：eval_locomo.py 客户端运行环境
+# 安装：pip install -r requirements.txt
+#
+# 注意：QwenPaw 服务端通过 Docker 部署，无需此文件。
+#       此文件仅用于运行评测脚本的 Python 环境。
+
+requests==2.32.3
+tqdm==4.67.1
