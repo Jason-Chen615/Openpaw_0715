@@ -10,6 +10,10 @@ LoCoMo × QwenPaw 评测脚本
     QWENPAW_BASE_URL   QwenPaw API 地址，默认 http://127.0.0.1:8088/api
     QWENPAW_API_USER   认证用户名（Docker 部署开启 Auth 时填写，pip 方式无需）
     QWENPAW_API_PASS   认证密码（Docker 部署开启 Auth 时填写，pip 方式无需）
+
+认证说明：
+    QwenPaw 使用 Bearer Token 认证。脚本启动时自动调用 /api/auth/login 获取
+    Token，后续所有请求携带 Authorization: Bearer <token> 头。
 """
 
 from __future__ import annotations
@@ -22,7 +26,6 @@ from collections import defaultdict
 from pathlib import Path
 
 import requests
-from requests.auth import HTTPBasicAuth
 
 try:
     from tqdm import tqdm
@@ -46,23 +49,69 @@ ANSWER_TIMEOUT: float = 30.0
 POLL_INTERVAL: float = 1.0
 # HTTP 请求超时（秒）
 REQUEST_TIMEOUT: int = 30
+
+# ─── 全局 Bearer Token（启动时通过 login 获取）──────────────────────────────────
+_BEARER_TOKEN: str = ""
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-def _auth() -> HTTPBasicAuth | None:
-    """返回 Basic Auth 对象，若未配置用户名则返回 None（pip 本地方式无需认证）。"""
-    if API_USER:
-        return HTTPBasicAuth(API_USER, API_PASS)
-    return None
+def _login() -> bool:
+    """
+    调用 POST /api/auth/login 获取 Bearer Token，存入全局 _BEARER_TOKEN。
+    若未配置用户名，跳过登录（pip 本地部署无需认证）。
+    返回 True 表示成功，False 表示失败。
+    """
+    global _BEARER_TOKEN
+    if not API_USER:
+        # pip 本地部署，不需要认证
+        return True
+
+    try:
+        resp = requests.post(
+            f"{BASE_URL}/auth/login",
+            json={"username": API_USER, "password": API_PASS},
+            timeout=REQUEST_TIMEOUT,
+        )
+    except requests.exceptions.ConnectionError:
+        return False
+
+    if not resp.ok:
+        print(f"[!] 登录失败: {resp.status_code} {resp.text[:120]}")
+        return False
+
+    data = resp.json()
+    token = data.get("token", "")
+    if not token:
+        print(f"[!] 登录响应中未找到 token 字段: {data}")
+        return False
+
+    _BEARER_TOKEN = token
+    print(f"[✓] 登录成功，已获取 Bearer Token（前 12 位：{token[:12]}...）")
+    return True
+
+
+def _auth_headers(extra: dict | None = None) -> dict:
+    """
+    构建带 Bearer Token 的请求头。
+    若 _BEARER_TOKEN 为空（pip 本地无认证），返回仅含 extra 的头。
+    """
+    headers: dict = {}
+    if _BEARER_TOKEN:
+        headers["Authorization"] = f"Bearer {_BEARER_TOKEN}"
+    if extra:
+        headers.update(extra)
+    return headers
 
 
 def _request(method: str, path: str, **kwargs) -> requests.Response:
-    """统一请求封装，附带认证与超时。"""
+    """统一请求封装，附带 Bearer Token 认证与超时。"""
     url = f"{BASE_URL}{path}"
     kwargs.setdefault("timeout", REQUEST_TIMEOUT)
-    auth = _auth()
-    if auth:
-        kwargs["auth"] = auth
+
+    # 合并 Bearer Token 认证头与调用方传入的 headers
+    caller_headers = kwargs.pop("headers", {})
+    kwargs["headers"] = _auth_headers(caller_headers)
+
     resp = requests.request(method, url, **kwargs)
     return resp
 
@@ -493,25 +542,38 @@ def main() -> None:
     print("  LoCoMo × QwenPaw 评测")
     print("=" * 64)
     print(f"  API 地址 : {BASE_URL}")
-    print(f"  认证     : {'已开启' if API_USER else '未开启（pip 本地部署）'}")
+    print(f"  认证     : {'已开启（Bearer Token）' if API_USER else '未开启（pip 本地部署）'}")
     print(f"  数据文件 : {args.data}")
     print(f"  Agent ID : {args.agent_id}")
     print(f"  输出文件 : {args.output}")
     print(f"  等待超时 : {ANSWER_TIMEOUT}s")
     print("=" * 64)
 
-    # 检查 QwenPaw 是否可达
+    # ── 登录获取 Bearer Token ──────────────────────────────────────────────────
+    if API_USER:
+        print(f"\n[Auth] 正在登录 QwenPaw（用户：{API_USER}）...")
+        if not _login():
+            print(
+                "[ERROR] 登录失败，请检查：\n"
+                "  1. QWENPAW_API_USER / QWENPAW_API_PASS 环境变量是否正确\n"
+                "  2. QwenPaw 是否已启动并可访问\n"
+                f"  3. curl -X POST {BASE_URL}/auth/login "
+                f"-d '{{\"username\":\"{API_USER}\",\"password\":\"***\"}}'"
+            )
+            raise SystemExit(1)
+
+    # ── 检查 QwenPaw 是否可达 ──────────────────────────────────────────────────
     try:
         _request("GET", "/agents")
     except requests.exceptions.ConnectionError:
         print(
             f"\n[ERROR] 无法连接到 QwenPaw: {BASE_URL}\n"
-            "        请确认 QwenPaw 已启动（qwenpaw app）且地址正确\n"
+            "        请确认 QwenPaw 已启动（docker compose up -d 或 qwenpaw app）\n"
             "        参考 how_to_do_with_pip.md 第四步"
         )
         raise SystemExit(1)
 
-    # 读取数据集
+    # ── 读取数据集 ──────────────────────────────────────────────────────────────
     data_path = Path(args.data)
     if not data_path.exists():
         print(f"[ERROR] 数据文件不存在: {data_path}")
@@ -522,10 +584,10 @@ def main() -> None:
 
     print(f"\n已加载 {len(dataset)} 个样本，来自 {data_path}\n")
 
-    # 创建评测 agent
+    # ── 创建评测 agent ─────────────────────────────────────────────────────────
     agent_id = create_eval_agent(args.agent_id)
 
-    # 逐 sample 评测
+    # ── 逐 sample 评测 ─────────────────────────────────────────────────────────
     all_results: list[dict] = []
     try:
         for sample in dataset:
