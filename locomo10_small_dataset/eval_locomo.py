@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-LoCoMo × QwenPaw 评测脚本
+LoCoMo × QwenPaw 评测脚本  (v3 — SSE 流式接口版)
 
 用法：
     python eval_locomo.py --data locomo_small.json --agent-id locomo_eval
@@ -8,13 +8,12 @@ LoCoMo × QwenPaw 评测脚本
 
 环境变量：
     QWENPAW_BASE_URL   QwenPaw API 地址，默认 http://127.0.0.1:8088/api
-    QWENPAW_API_USER   认证用户名（Docker 部署开启 Auth 时填写，pip 方式无需）
-    QWENPAW_API_PASS   认证密码（Docker 部署开启 Auth 时填写，pip 方式无需）
+    QWENPAW_API_USER   认证用户名（Docker 部署开启 Auth 时填写）
+    QWENPAW_API_PASS   认证密码
 
-接口说明（已从源码确认）：
-    - 用户→agent 发消息：POST /api/console/chat/task（后台任务）
-    - 轮询任务结果：    GET  /api/console/chat/task/{task_id}
-    - /api/messages/send 是 agent→用户 推送，不适合评测
+接口（已验证）：
+    POST /api/console/chat   — SSE 流式，user→agent 发消息并获取回复
+    认证：Bearer Token（通过 POST /api/auth/login 获取）
 """
 
 from __future__ import annotations
@@ -41,10 +40,9 @@ API_PASS: str = os.getenv("QWENPAW_API_PASS", "")
 
 USER_ID = "evaluator"
 
-TURN_DELAY: float = 0.5          # 喂对话 turn 之间的间隔（秒）
-ANSWER_TIMEOUT: float = 120.0    # 等待 agent 回答的最大时间（秒）
-POLL_INTERVAL: float = 2.0       # 轮询任务状态的间隔（秒）
-REQUEST_TIMEOUT: int = 60        # HTTP 请求超时（秒）
+TURN_DELAY: float = 0.3       # 喂对话 turn 之间的间隔（秒）
+ANSWER_TIMEOUT: float = 120.0  # SSE 流等待超时（秒）
+REQUEST_TIMEOUT: int = 130     # HTTP 请求超时（需大于 ANSWER_TIMEOUT）
 
 _BEARER_TOKEN: str = ""
 # ──────────────────────────────────────────────────────────────────────────────
@@ -53,6 +51,7 @@ _BEARER_TOKEN: str = ""
 # ─── 认证 ─────────────────────────────────────────────────────────────────────
 
 def _login() -> bool:
+    """登录获取 Bearer Token。无 API_USER 时跳过（pip 本地无认证部署）。"""
     global _BEARER_TOKEN
     if not API_USER:
         return True
@@ -60,7 +59,7 @@ def _login() -> bool:
         resp = requests.post(
             f"{BASE_URL}/auth/login",
             json={"username": API_USER, "password": API_PASS},
-            timeout=REQUEST_TIMEOUT,
+            timeout=30,
         )
     except requests.exceptions.ConnectionError:
         return False
@@ -76,8 +75,9 @@ def _login() -> bool:
     return True
 
 
-def _auth_headers(extra: dict | None = None) -> dict:
-    h: dict = {}
+def _base_headers(extra: dict | None = None) -> dict:
+    """构建带 Bearer Token 的请求头。"""
+    h: dict = {"Content-Type": "application/json"}
     if _BEARER_TOKEN:
         h["Authorization"] = f"Bearer {_BEARER_TOKEN}"
     if extra:
@@ -85,25 +85,125 @@ def _auth_headers(extra: dict | None = None) -> dict:
     return h
 
 
-def _request(method: str, path: str, **kwargs) -> requests.Response:
-    url = f"{BASE_URL}{path}"
-    kwargs.setdefault("timeout", REQUEST_TIMEOUT)
-    caller_headers = kwargs.pop("headers", {})
-    kwargs["headers"] = _auth_headers(caller_headers)
-    return requests.request(method, url, **kwargs)
+# ─── SSE 核心：POST /api/console/chat ──────────────────────────────────────────
+
+def _sse_chat(
+    agent_id: str,
+    session_id: str,
+    text: str,
+    collect_reply: bool = True,
+    timeout: float = ANSWER_TIMEOUT,
+) -> str:
+    """
+    通过 POST /api/console/chat（SSE 流式）向 agent 发消息。
+
+    Args:
+        agent_id:      目标 agent 的 ID
+        session_id:    会话 ID（同一 session 维持对话记忆）
+        text:          发送的文本内容
+        collect_reply: True 时收集并返回完整回复文本；False 时只等流结束
+        timeout:       等待流结束的最大秒数
+
+    Returns:
+        agent 的文本回复（collect_reply=False 时返回空字符串）
+    """
+    payload = {
+        "user_id": USER_ID,
+        "session_id": session_id,
+        "input": [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": text}],
+            }
+        ],
+    }
+
+    headers = _base_headers({"X-Agent-Id": agent_id, "Accept": "text/event-stream"})
+
+    try:
+        with requests.post(
+            f"{BASE_URL}/console/chat",
+            json=payload,
+            headers=headers,
+            stream=True,
+            timeout=timeout,
+        ) as resp:
+            if not resp.ok:
+                print(f"  [!] /console/chat 请求失败: {resp.status_code} {resp.text[:120]}")
+                return ""
+
+            if not collect_reply:
+                # 只消费流，不收集内容（喂 turn 用）
+                for _ in resp.iter_lines():
+                    pass
+                return ""
+
+            # 收集 SSE 流中的文本片段
+            reply_parts: list[str] = []
+            for raw_line in resp.iter_lines():
+                if not raw_line:
+                    continue
+                # iter_lines 返回 bytes 或 str
+                line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
+                if not line.startswith("data:"):
+                    continue
+                data_str = line[5:].strip()
+                if data_str in ("", "[DONE]"):
+                    continue
+                try:
+                    event = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+
+                # 跳过 token 用量等元数据事件
+                ev_type = event.get("type", "")
+                if ev_type in ("turn_usage", "error", "ping"):
+                    continue
+
+                # 提取文本内容（兼容多种字段格式）
+                content = event.get("content", "")
+                if isinstance(content, str) and content:
+                    reply_parts.append(content)
+                elif isinstance(content, list):
+                    for c in content:
+                        if isinstance(c, dict) and c.get("type") == "text":
+                            t = c.get("text", "")
+                            if t:
+                                reply_parts.append(t)
+
+                # 兼容直接放在 text 字段的格式
+                text_field = event.get("text", "")
+                if isinstance(text_field, str) and text_field and not content:
+                    reply_parts.append(text_field)
+
+                # output 字段（部分版本）
+                output = event.get("output", "")
+                if isinstance(output, str) and output and not content and not text_field:
+                    reply_parts.append(output)
+
+            return "".join(reply_parts).strip()
+
+    except requests.exceptions.Timeout:
+        print(f"  [!] SSE 流等待超时（>{timeout}s）")
+        return ""
+    except requests.exceptions.RequestException as e:
+        print(f"  [!] 请求异常: {e}")
+        return ""
 
 
 # ─── Agent 管理 ───────────────────────────────────────────────────────────────
 
 def create_eval_agent(agent_id: str) -> str:
-    resp = _request(
-        "POST", "/agents",
+    resp = requests.post(
+        f"{BASE_URL}/agents",
         json={
             "id": agent_id,
             "name": "LoCoMo Evaluator",
             "description": "Automated evaluation agent for LoCoMo benchmark.",
             "language": "en",
         },
+        headers=_base_headers(),
+        timeout=30,
     )
     if resp.status_code == 201:
         print(f"[✓] Agent '{agent_id}' 创建成功")
@@ -114,148 +214,10 @@ def create_eval_agent(agent_id: str) -> str:
     return agent_id
 
 
-def delete_eval_agent(agent_id: str) -> None:
-    if agent_id == "default":
-        return
-    resp = _request("DELETE", f"/agents/{agent_id}")
-    if resp.ok:
-        print(f"[✓] Agent '{agent_id}' 已删除")
-
-
-# ─── 核心：通过 /console/chat/task 发消息并等待回复 ──────────────────────────
-
-def _chat_task(
-    agent_id: str,
-    session_id: str,
-    text: str,
-    timeout: float = ANSWER_TIMEOUT,
-) -> str | None:
-    """
-    发送消息给 agent 并等待回复。
-
-    使用 POST /api/console/chat/task 提交后台任务，然后轮询
-    GET /api/console/chat/task/{task_id} 直到任务完成或超时。
-
-    返回 agent 的文字回复，超时或失败返回 None。
-    """
-    payload = {
-        "user_id": USER_ID,
-        "session_id": session_id,
-        "input": [
-            {
-                "role": "user",
-                "content": [{"type": "text", "text": text}],
-            }
-        ],
-        "timeout": timeout,
-    }
-
-    # 提交后台任务
-    resp = _request(
-        "POST", "/console/chat/task",
-        headers={"X-Agent-Id": agent_id},
-        json=payload,
-    )
-    if not resp.ok:
-        print(f"  [!] 提交任务失败: {resp.status_code} {resp.text[:120]}")
-        return None
-
-    task_id = resp.json().get("task_id")
-    if not task_id:
-        print(f"  [!] 响应中无 task_id: {resp.json()}")
-        return None
-
-    # 轮询任务结果
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        time.sleep(POLL_INTERVAL)
-        poll_resp = _request(
-            "GET", f"/console/chat/task/{task_id}",
-            headers={"X-Agent-Id": agent_id},
-        )
-        if not poll_resp.ok:
-            continue
-
-        data = poll_resp.json()
-        status = data.get("status")
-
-        if status == "finished":
-            result = data.get("result", {})
-            if result.get("status") == "failed":
-                err = result.get("error", {}).get("message", "unknown error")
-                print(f"  [!] 任务失败: {err}")
-                return None
-
-            # 从 output 字段提取文本回复
-            output = result.get("output", [])
-            if isinstance(output, list):
-                texts = []
-                for item in output:
-                    if isinstance(item, dict):
-                        content = item.get("content", "")
-                        if isinstance(content, str) and content.strip():
-                            texts.append(content.strip())
-                        elif isinstance(content, list):
-                            for c in content:
-                                if isinstance(c, dict) and c.get("type") == "text":
-                                    t = c.get("text", "").strip()
-                                    if t:
-                                        texts.append(t)
-                if texts:
-                    return " ".join(texts)
-
-            # 尝试直接从 result.text 取
-            if isinstance(result.get("text"), str):
-                return result["text"].strip()
-
-            return str(result)
-
-    return None  # 超时
-
-
 # ─── 对话喂入 ─────────────────────────────────────────────────────────────────
 
-def feed_turn(agent_id: str, session_id: str, text: str) -> None:
-    """
-    向 agent 喂入单条对话 turn（不等回复，用于构建上下文）。
-    使用后台任务接口，但不等待完成。
-    """
-    payload = {
-        "user_id": USER_ID,
-        "session_id": session_id,
-        "input": [
-            {
-                "role": "user",
-                "content": [{"type": "text", "text": text}],
-            }
-        ],
-        "timeout": 60,
-    }
-    resp = _request(
-        "POST", "/console/chat/task",
-        headers={"X-Agent-Id": agent_id},
-        json=payload,
-    )
-    if not resp.ok:
-        print(f"  [!] 喂入 turn 失败: {resp.status_code} {resp.text[:80]}")
-        return
-
-    # 短暂等待，让 agent 处理完这条 turn 再发下一条
-    task_id = resp.json().get("task_id")
-    if task_id:
-        deadline = time.time() + 60
-        while time.time() < deadline:
-            time.sleep(POLL_INTERVAL)
-            pr = _request(
-                "GET", f"/console/chat/task/{task_id}",
-                headers={"X-Agent-Id": agent_id},
-            )
-            if pr.ok and pr.json().get("status") == "finished":
-                break
-
-
 def feed_conversation(agent_id: str, session_id: str, conversation: dict) -> None:
-    """按时序将 4 个 session 的对话喂入 agent。"""
+    """按时序将 4 个 session 的对话喂入 agent（不收集回复，只建立记忆）。"""
     turns_fed = 0
     for s_idx in range(1, 5):
         key = f"session_{s_idx}"
@@ -267,11 +229,12 @@ def feed_conversation(agent_id: str, session_id: str, conversation: dict) -> Non
         turns = conversation[key]
         print(f"    [Session {s_idx}] {date_str} — {len(turns)} 条对话")
 
-        # 注入时间背景（system 提示）
-        feed_turn(
+        # 先注入时间背景
+        _sse_chat(
             agent_id, session_id,
             f"[System Context] The following conversation took place on: {date_str}. "
             "Please remember all details for future questions.",
+            collect_reply=False,
         )
         time.sleep(TURN_DELAY)
 
@@ -283,12 +246,16 @@ def feed_conversation(agent_id: str, session_id: str, conversation: dict) -> Non
             img = imgs[0] if imgs else None
             caption = turn.get("blip_caption", "")
 
-            if caption and not img:
-                text = f"{text} [Image description: {caption}]"
-            elif img:
+            if img:
                 text = f"[Image URL: {img}]\n{text}"
+            elif caption:
+                text = f"{text} [Image description: {caption}]"
 
-            feed_turn(agent_id, session_id, f"{speaker}: {text}")
+            _sse_chat(
+                agent_id, session_id,
+                f"{speaker}: {text}",
+                collect_reply=False,
+            )
             turns_fed += 1
             time.sleep(TURN_DELAY)
 
@@ -341,14 +308,16 @@ def evaluate_sample(agent_id: str, sample: dict) -> list[dict]:
         category = qa.get("category", 0)
         evidence = qa.get("evidence", [])
 
-        got_raw = _chat_task(
+        got = _sse_chat(
             agent_id, session_id,
-            f"Based on our conversation history, please answer this question concisely: {question}",
+            f"Based on our conversation history, please answer concisely: {question}",
+            collect_reply=True,
             timeout=ANSWER_TIMEOUT,
         )
-        got = got_raw if got_raw else "[TIMEOUT/ERROR]"
-        correct = judge_answer(category, expected, got)
+        if not got:
+            got = "[TIMEOUT/NO_REPLY]"
 
+        correct = judge_answer(category, expected, got)
         results.append({
             "sample_id": sample_id,
             "category": category,
@@ -359,9 +328,9 @@ def evaluate_sample(agent_id: str, sample: dict) -> list[dict]:
             "evidence": evidence,
         })
 
-        status = "✓" if correct else "✗"
+        mark = "✓" if correct else "✗"
         print(
-            f"  [{status}] Cat{category} | {question[:55]}\n"
+            f"  [{mark}] Cat{category} | {question[:55]}\n"
             f"       期望: {expected}\n"
             f"       回答: {got[:100]}"
         )
@@ -437,32 +406,33 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    global BASE_URL, ANSWER_TIMEOUT
+    global BASE_URL, ANSWER_TIMEOUT, REQUEST_TIMEOUT
     if args.base_url:
         BASE_URL = args.base_url
     ANSWER_TIMEOUT = args.answer_timeout
+    REQUEST_TIMEOUT = int(ANSWER_TIMEOUT) + 10
 
     print("=" * 64)
-    print("  LoCoMo × QwenPaw 评测")
+    print("  LoCoMo × QwenPaw 评测  (SSE 流式接口版)")
     print("=" * 64)
     print(f"  API 地址 : {BASE_URL}")
     print(f"  认证     : {'Bearer Token' if API_USER else '无（pip 本地部署）'}")
     print(f"  数据文件 : {args.data}")
     print(f"  Agent ID : {args.agent_id}")
     print(f"  输出文件 : {args.output}")
-    print(f"  等待超时 : {ANSWER_TIMEOUT}s")
+    print(f"  SSE 超时 : {ANSWER_TIMEOUT}s")
     print("=" * 64)
 
     # 登录
     if API_USER:
-        print(f"\n[Auth] 正在登录 QwenPaw（用户：{API_USER}）...")
+        print(f"\n[Auth] 正在登录（用户：{API_USER}）...")
         if not _login():
             print("[ERROR] 登录失败，请检查 QWENPAW_API_USER / QWENPAW_API_PASS")
             raise SystemExit(1)
 
-    # 检查连通性
+    # 连通性检查
     try:
-        _request("GET", "/agents")
+        requests.get(f"{BASE_URL}/agents", headers=_base_headers(), timeout=10)
     except requests.exceptions.ConnectionError:
         print(f"\n[ERROR] 无法连接到 QwenPaw: {BASE_URL}")
         raise SystemExit(1)
@@ -488,7 +458,7 @@ def main() -> None:
     finally:
         if all_results:
             metrics = compute_metrics(all_results)
-            output = {
+            out_data = {
                 "config": {
                     "base_url": BASE_URL,
                     "agent_id": agent_id,
@@ -501,12 +471,16 @@ def main() -> None:
             out_path = Path(args.output)
             out_path.parent.mkdir(parents=True, exist_ok=True)
             with open(out_path, "w", encoding="utf-8") as f:
-                json.dump(output, f, ensure_ascii=False, indent=2)
+                json.dump(out_data, f, ensure_ascii=False, indent=2)
             print_metrics(metrics)
             print(f"[✓] 结果已保存到 {out_path}")
 
         if args.delete_after:
-            _request("DELETE", f"/agents/{agent_id}")
+            requests.delete(
+                f"{BASE_URL}/agents/{agent_id}",
+                headers=_base_headers(),
+                timeout=10,
+            )
 
 
 if __name__ == "__main__":
