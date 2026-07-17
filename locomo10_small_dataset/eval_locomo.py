@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-LoCoMo × QwenPaw 评测脚本  (v3 — SSE 流式接口版)
+LoCoMo × QwenPaw 评测脚本  (v4 — 自然语言记忆注入版)
 
 用法：
     python eval_locomo.py --data locomo_small.json --agent-id locomo_eval
@@ -40,7 +40,7 @@ API_PASS: str = os.getenv("QWENPAW_API_PASS", "")
 
 USER_ID = "evaluator"
 
-TURN_DELAY: float = 0.3       # 喂对话 turn 之间的间隔（秒）
+TURN_DELAY: float = 0.3       # session 之间的间隔（秒）
 ANSWER_TIMEOUT: float = 120.0  # SSE 流等待超时（秒）
 REQUEST_TIMEOUT: int = 130     # HTTP 请求超时（需大于 ANSWER_TIMEOUT）
 
@@ -133,7 +133,7 @@ def _sse_chat(
                 return ""
 
             if not collect_reply:
-                # 只消费流，不收集内容（喂 turn 用）
+                # 只消费流，不收集内容
                 for _ in resp.iter_lines():
                     pass
                 return ""
@@ -216,30 +216,36 @@ def create_eval_agent(agent_id: str) -> str:
 
 # ─── 对话喂入 ─────────────────────────────────────────────────────────────────
 
-def feed_conversation(agent_id: str, session_id: str, conversation: dict) -> None:
-    """按时序将 4 个 session 的对话喂入 agent（不收集回复，只建立记忆）。"""
+def feed_conversation(agent_id: str, sample_id: str, conversation: dict) -> str:
+    """
+    将每个 session 的所有对话整体打包成一条自然语言消息发给 agent，
+    agent 会主动将其存入记忆系统。每个 session 使用独立的 context，
+    注入完毕后自然 reset，避免上下文积压。
+
+    Returns:
+        最后一个有内容 session 的日期字符串（供 QA 阶段使用）
+    """
+    last_date_str = ""
     turns_fed = 0
+
     for s_idx in range(1, 5):
         key = f"session_{s_idx}"
         date_key = f"session_{s_idx}_date_time"
         if key not in conversation:
             continue
 
-        date_str = conversation.get(date_key, f"Session {s_idx}")
         turns = conversation[key]
+        if not turns:
+            continue
+
+        date_str = conversation.get(date_key, f"Session {s_idx}")
+        last_date_str = date_str
+
         print(f"    [Session {s_idx}] {date_str} — {len(turns)} 条对话")
 
-        # 先注入时间背景
-        _sse_chat(
-            agent_id, session_id,
-            f"[System Context] The following conversation took place on: {date_str}. "
-            "Please remember all details for future questions.",
-            collect_reply=False,
-        )
-        time.sleep(TURN_DELAY)
-
-        iter_turns = tqdm(turns, desc=f"  S{s_idx}", leave=False) if HAS_TQDM else turns
-        for turn in iter_turns:
+        # 将整个 session 的所有 turn 拼成对话文本
+        lines: list[str] = []
+        for turn in turns:
             speaker = turn.get("speaker", "Unknown")
             text = turn.get("text", "")
             imgs = turn.get("img_url", [])
@@ -247,19 +253,31 @@ def feed_conversation(agent_id: str, session_id: str, conversation: dict) -> Non
             caption = turn.get("blip_caption", "")
 
             if img:
-                text = f"[Image URL: {img}]\n{text}"
+                text = f"[Image URL: {img}] {text}".strip()
             elif caption:
-                text = f"{text} [Image description: {caption}]"
+                text = f"{text} [Image description: {caption}]".strip()
 
-            _sse_chat(
-                agent_id, session_id,
-                f"{speaker}: {text}",
-                collect_reply=False,
-            )
+            lines.append(f"{speaker}: {text}")
             turns_fed += 1
-            time.sleep(TURN_DELAY)
+
+        # 整体打包成一条自然语言消息，让 agent 主动存入记忆系统
+        big_message = (
+            f"Remember to your memory, [group chat conversation: {date_str}]\n\n"
+            + "\n".join(lines)
+        )
+
+        # 每个 session 用独立的临时 session_id，注入后 context 自然隔离
+        ingest_session_id = f"ingest_{sample_id}_s{s_idx}"
+        _sse_chat(
+            agent_id, ingest_session_id,
+            big_message,
+            collect_reply=True,
+            timeout=ANSWER_TIMEOUT,
+        )
+        time.sleep(TURN_DELAY)
 
     print(f"    → 共喂入 {turns_fed} 条对话")
+    return last_date_str
 
 
 # ─── 评判 ─────────────────────────────────────────────────────────────────────
@@ -286,20 +304,22 @@ def judge_answer(category: int, expected: str, got: str) -> bool:
 
 def evaluate_sample(agent_id: str, sample: dict) -> list[dict]:
     sample_id = sample["sample_id"]
-    session_id = f"eval_{sample_id.replace('-', '_')}_{int(time.time())}"
+    safe_id = sample_id.replace("-", "_")
 
     print(f"\n{'='*64}")
     print(f"  Sample : {sample_id}")
-    print(f"  Session: {session_id}")
     print(f"  QA 数量: {len(sample.get('qa', []))}")
     print(f"{'='*64}")
 
     print("[1/2] 喂入对话...")
-    feed_conversation(agent_id, session_id, sample["conversation"])
+    last_date_str = feed_conversation(agent_id, safe_id, sample["conversation"])
 
     print("[2/2] 开始 QA 评测...")
     results: list[dict] = []
     qa_list = sample.get("qa", [])
+
+    # QA 阶段使用独立的新 session，agent 从记忆系统中检索作答
+    eval_session_id = f"eval_{safe_id}_{int(time.time())}"
 
     iter_qa = tqdm(qa_list, desc="  QA") if HAS_TQDM else qa_list
     for qa in iter_qa:
@@ -308,9 +328,14 @@ def evaluate_sample(agent_id: str, sample: dict) -> list[dict]:
         category = qa.get("category", 0)
         evidence = qa.get("evidence", [])
 
+        if last_date_str:
+            prompt = f"Current date: {last_date_str}\nAnswer the question directly: {question}"
+        else:
+            prompt = f"Answer the question directly: {question}"
+
         got = _sse_chat(
-            agent_id, session_id,
-            f"Based on our conversation history, please answer concisely: {question}",
+            agent_id, eval_session_id,
+            prompt,
             collect_reply=True,
             timeout=ANSWER_TIMEOUT,
         )
@@ -413,7 +438,7 @@ def main() -> None:
     REQUEST_TIMEOUT = int(ANSWER_TIMEOUT) + 10
 
     print("=" * 64)
-    print("  LoCoMo × QwenPaw 评测  (SSE 流式接口版)")
+    print("  LoCoMo × QwenPaw 评测  (v4 — 自然语言记忆注入版)")
     print("=" * 64)
     print(f"  API 地址 : {BASE_URL}")
     print(f"  认证     : {'Bearer Token' if API_USER else '无（pip 本地部署）'}")
