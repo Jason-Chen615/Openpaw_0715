@@ -1,19 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-LoCoMo × QwenPaw 评测脚本  (v4 — 自然语言记忆注入版)
+LoCoMo x QwenPaw  (v6 -- pure QA eval, memory pre-loaded by prepare_memory.py)
 
-用法：
+Usage:
     python eval_locomo.py --data locomo_small.json --agent-id locomo_eval
-    python eval_locomo.py --data locomo_small.json --agent-id locomo_eval --output results.json
+    python eval_locomo.py --data locomo_small.json --agent-id locomo_eval --results-dir results
 
-环境变量：
-    QWENPAW_BASE_URL   QwenPaw API 地址，默认 http://127.0.0.1:8088/api
-    QWENPAW_API_USER   认证用户名（Docker 部署开启 Auth 时填写）
-    QWENPAW_API_PASS   认证密码
+Env vars:
+    QWENPAW_BASE_URL   default http://127.0.0.1:8088/api
+    QWENPAW_API_USER   auth username (Docker deployments)
+    QWENPAW_API_PASS   auth password
 
-接口（已验证）：
-    POST /api/console/chat   — SSE 流式，user→agent 发消息并获取回复
-    认证：Bearer Token（通过 POST /api/auth/login 获取）
+v6 vs v5:
+    v5: feed_conversation (ingest 4 sessions) -> QA
+    v6: skip ingest; memory/*.md already written by prepare_memory.py
+        - each QA uses an independent session (create -> chat -> delete)
+        - prompt forces memory_search tool call before answering
+        - outputs results/eval_results.json and results/metrics.json
 """
 
 from __future__ import annotations
@@ -33,25 +36,24 @@ try:
 except ImportError:
     HAS_TQDM = False
 
-# ─── 配置 ─────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 BASE_URL: str = os.getenv("QWENPAW_BASE_URL", "http://127.0.0.1:8088/api")
 API_USER: str = os.getenv("QWENPAW_API_USER", "")
 API_PASS: str = os.getenv("QWENPAW_API_PASS", "")
 
 USER_ID = "evaluator"
 
-TURN_DELAY: float = 0.3       # session 之间的间隔（秒）
-ANSWER_TIMEOUT: float = 120.0  # SSE 流等待超时（秒）
-REQUEST_TIMEOUT: int = 130     # HTTP 请求超时（需大于 ANSWER_TIMEOUT）
+TURN_DELAY: float = 0.3
+ANSWER_TIMEOUT: float = 120.0
+REQUEST_TIMEOUT: int = 130
 
 _BEARER_TOKEN: str = ""
-# ──────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
 
-# ─── 认证 ─────────────────────────────────────────────────────────────────────
+# --- auth ------------------------------------------------------------------
 
 def _login() -> bool:
-    """登录获取 Bearer Token。无 API_USER 时跳过（pip 本地无认证部署）。"""
     global _BEARER_TOKEN
     if not API_USER:
         return True
@@ -64,19 +66,18 @@ def _login() -> bool:
     except requests.exceptions.ConnectionError:
         return False
     if not resp.ok:
-        print(f"[!] 登录失败: {resp.status_code} {resp.text[:120]}")
+        print(f"[!] Login failed: {resp.status_code} {resp.text[:120]}")
         return False
     token = resp.json().get("token", "")
     if not token:
-        print(f"[!] 登录响应中未找到 token: {resp.json()}")
+        print(f"[!] No token in login response: {resp.json()}")
         return False
     _BEARER_TOKEN = token
-    print(f"[✓] 登录成功，Token 前 12 位：{token[:12]}...")
+    print(f"[+] Logged in, token prefix: {token[:12]}...")
     return True
 
 
-def _base_headers(extra: dict | None = None) -> dict:
-    """构建带 Bearer Token 的请求头。"""
+def _headers(extra: dict | None = None) -> dict:
     h: dict = {"Content-Type": "application/json"}
     if _BEARER_TOKEN:
         h["Authorization"] = f"Bearer {_BEARER_TOKEN}"
@@ -85,28 +86,31 @@ def _base_headers(extra: dict | None = None) -> dict:
     return h
 
 
-# ─── SSE 核心：POST /api/console/chat ──────────────────────────────────────────
+# --- session management ----------------------------------------------------
+
+def delete_session(agent_id: str, session_id: str) -> None:
+    """Delete a session after each QA to free context."""
+    try:
+        resp = requests.delete(
+            f"{BASE_URL}/sessions/{session_id}",
+            headers=_headers({"X-Agent-Id": agent_id}),
+            timeout=15,
+        )
+        if not resp.ok and resp.status_code != 404:
+            print(f"  [session] delete failed: {resp.status_code}")
+    except requests.exceptions.RequestException:
+        pass  # non-critical
+
+
+# --- SSE chat --------------------------------------------------------------
 
 def _sse_chat(
     agent_id: str,
     session_id: str,
     text: str,
-    collect_reply: bool = True,
     timeout: float = ANSWER_TIMEOUT,
 ) -> str:
-    """
-    通过 POST /api/console/chat（SSE 流式）向 agent 发消息。
-
-    Args:
-        agent_id:      目标 agent 的 ID
-        session_id:    会话 ID（同一 session 维持对话记忆）
-        text:          发送的文本内容
-        collect_reply: True 时收集并返回完整回复文本；False 时只等流结束
-        timeout:       等待流结束的最大秒数
-
-    Returns:
-        agent 的文本回复（collect_reply=False 时返回空字符串）
-    """
+    """POST /api/console/chat (SSE stream) -> full reply text."""
     payload = {
         "user_id": USER_ID,
         "session_id": session_id,
@@ -117,34 +121,25 @@ def _sse_chat(
             }
         ],
     }
-
-    headers = _base_headers({"X-Agent-Id": agent_id, "Accept": "text/event-stream"})
+    req_headers = _headers({"X-Agent-Id": agent_id, "Accept": "text/event-stream"})
 
     try:
         with requests.post(
             f"{BASE_URL}/console/chat",
             json=payload,
-            headers=headers,
+            headers=req_headers,
             stream=True,
             timeout=timeout,
         ) as resp:
             if not resp.ok:
-                print(f"  [!] /console/chat 请求失败: {resp.status_code} {resp.text[:120]}")
+                print(f"  [!] chat failed: {resp.status_code} {resp.text[:120]}")
                 return ""
 
-            if not collect_reply:
-                # 只消费流，不收集内容
-                for _ in resp.iter_lines():
-                    pass
-                return ""
-
-            # 收集 SSE 流中的文本片段
-            reply_parts: list[str] = []
-            for raw_line in resp.iter_lines():
-                if not raw_line:
+            parts: list[str] = []
+            for raw in resp.iter_lines():
+                if not raw:
                     continue
-                # iter_lines 返回 bytes 或 str
-                line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
+                line = raw.decode("utf-8") if isinstance(raw, bytes) else raw
                 if not line.startswith("data:"):
                     continue
                 data_str = line[5:].strip()
@@ -155,45 +150,41 @@ def _sse_chat(
                 except json.JSONDecodeError:
                     continue
 
-                # 跳过 token 用量等元数据事件
                 ev_type = event.get("type", "")
                 if ev_type in ("turn_usage", "error", "ping"):
                     continue
 
-                # 提取文本内容（兼容多种字段格式）
                 content = event.get("content", "")
                 if isinstance(content, str) and content:
-                    reply_parts.append(content)
+                    parts.append(content)
                 elif isinstance(content, list):
                     for c in content:
                         if isinstance(c, dict) and c.get("type") == "text":
                             t = c.get("text", "")
                             if t:
-                                reply_parts.append(t)
+                                parts.append(t)
 
-                # 兼容直接放在 text 字段的格式
                 text_field = event.get("text", "")
                 if isinstance(text_field, str) and text_field and not content:
-                    reply_parts.append(text_field)
+                    parts.append(text_field)
 
-                # output 字段（部分版本）
                 output = event.get("output", "")
                 if isinstance(output, str) and output and not content and not text_field:
-                    reply_parts.append(output)
+                    parts.append(output)
 
-            return "".join(reply_parts).strip()
+            return "".join(parts).strip()
 
     except requests.exceptions.Timeout:
-        print(f"  [!] SSE 流等待超时（>{timeout}s）")
+        print(f"  [!] SSE timeout (>{timeout}s)")
         return ""
-    except requests.exceptions.RequestException as e:
-        print(f"  [!] 请求异常: {e}")
+    except requests.exceptions.RequestException as exc:
+        print(f"  [!] request error: {exc}")
         return ""
 
 
-# ─── Agent 管理 ───────────────────────────────────────────────────────────────
+# --- agent management ------------------------------------------------------
 
-def create_eval_agent(agent_id: str) -> str:
+def ensure_agent(agent_id: str) -> str:
     resp = requests.post(
         f"{BASE_URL}/agents",
         json={
@@ -202,85 +193,53 @@ def create_eval_agent(agent_id: str) -> str:
             "description": "Automated evaluation agent for LoCoMo benchmark.",
             "language": "en",
         },
-        headers=_base_headers(),
+        headers=_headers(),
         timeout=30,
     )
     if resp.status_code == 201:
-        print(f"[✓] Agent '{agent_id}' 创建成功")
+        print(f"[+] Agent '{agent_id}' created")
     elif resp.status_code in (400, 409):
-        print(f"[~] Agent '{agent_id}' 已存在，直接复用")
+        print(f"[~] Agent '{agent_id}' already exists, reusing")
     else:
-        print(f"[!] 创建 agent 异常: {resp.status_code} {resp.text[:120]}")
+        print(f"[!] Agent create: {resp.status_code} {resp.text[:120]}")
     return agent_id
 
 
-# ─── 对话喂入 ─────────────────────────────────────────────────────────────────
+# --- QA prompt building ----------------------------------------------------
 
-def feed_conversation(agent_id: str, sample_id: str, conversation: dict) -> str:
-    """
-    将每个 session 的所有对话整体打包成一条自然语言消息发给 agent，
-    agent 会主动将其存入记忆系统。每个 session 使用独立的 context，
-    注入完毕后自然 reset，避免上下文积压。
+# Prompt that forces the agent to call memory_search before answering.
+_QA_PROMPT_TMPL = """\
+You MUST call the memory_search tool first to retrieve relevant memories before answering.
 
-    Returns:
-        最后一个有内容 session 的日期字符串（供 QA 阶段使用）
-    """
-    last_date_str = ""
-    turns_fed = 0
+Question: {question}
 
-    for s_idx in range(1, 5):
-        key = f"session_{s_idx}"
-        date_key = f"session_{s_idx}_date_time"
-        if key not in conversation:
-            continue
+Instructions:
+1. Call memory_search with keywords from the question.
+2. Read the retrieved memories carefully.
+3. Answer the question concisely based on the memories.
+Do NOT answer from general knowledge alone."""
 
-        turns = conversation[key]
-        if not turns:
-            continue
+_QA_PROMPT_WITH_DATE_TMPL = """\
+Current date context: {date}
 
-        date_str = conversation.get(date_key, f"Session {s_idx}")
-        last_date_str = date_str
+You MUST call the memory_search tool first to retrieve relevant memories before answering.
 
-        print(f"    [Session {s_idx}] {date_str} — {len(turns)} 条对话")
+Question: {question}
 
-        # 将整个 session 的所有 turn 拼成对话文本
-        lines: list[str] = []
-        for turn in turns:
-            speaker = turn.get("speaker", "Unknown")
-            text = turn.get("text", "")
-            imgs = turn.get("img_url", [])
-            img = imgs[0] if imgs else None
-            caption = turn.get("blip_caption", "")
-
-            if img:
-                text = f"[Image URL: {img}] {text}".strip()
-            elif caption:
-                text = f"{text} [Image description: {caption}]".strip()
-
-            lines.append(f"{speaker}: {text}")
-            turns_fed += 1
-
-        # 整体打包成一条自然语言消息，让 agent 主动存入记忆系统
-        big_message = (
-            f"Remember to your memory, [group chat conversation: {date_str}]\n\n"
-            + "\n".join(lines)
-        )
-
-        # 每个 session 用独立的临时 session_id，注入后 context 自然隔离
-        ingest_session_id = f"ingest_{sample_id}_s{s_idx}"
-        _sse_chat(
-            agent_id, ingest_session_id,
-            big_message,
-            collect_reply=True,
-            timeout=ANSWER_TIMEOUT,
-        )
-        time.sleep(TURN_DELAY)
-
-    print(f"    → 共喂入 {turns_fed} 条对话")
-    return last_date_str
+Instructions:
+1. Call memory_search with keywords from the question.
+2. Read the retrieved memories carefully.
+3. Answer the question concisely based on the memories.
+Do NOT answer from general knowledge alone."""
 
 
-# ─── 评判 ─────────────────────────────────────────────────────────────────────
+def build_qa_prompt(question: str, date_ctx: str = "") -> str:
+    if date_ctx:
+        return _QA_PROMPT_WITH_DATE_TMPL.format(date=date_ctx, question=question)
+    return _QA_PROMPT_TMPL.format(question=question)
+
+
+# --- judge -----------------------------------------------------------------
 
 _CORRECTION_SIGNALS = [
     "actually", "correction", "incorrect", "wrong", "not ", "it was",
@@ -289,62 +248,64 @@ _CORRECTION_SIGNALS = [
 
 
 def judge_answer(category: int, expected: str, got: str) -> bool:
-    exp_lower = expected.lower().strip()
-    got_lower = got.lower().strip()
-    if exp_lower in got_lower:
+    exp = expected.lower().strip()
+    ans = got.lower().strip()
+    if exp in ans:
         return True
-    if len(got_lower) > 3 and got_lower in exp_lower:
+    if len(ans) > 3 and ans in exp:
         return True
     if category == 5:
-        return any(sig in got_lower for sig in _CORRECTION_SIGNALS)
+        return any(sig in ans for sig in _CORRECTION_SIGNALS)
     return False
 
 
-# ─── 单 sample 评测 ───────────────────────────────────────────────────────────
+# --- per-sample evaluation -------------------------------------------------
+
+def _get_date_ctx(sample: dict) -> str:
+    """Return the date string of the last non-empty session."""
+    last = ""
+    for s_idx in range(1, 5):
+        turns = sample.get("conversation", {}).get(f"session_{s_idx}", [])
+        date = sample.get("conversation", {}).get(f"session_{s_idx}_date_time", "")
+        if turns and date:
+            last = date
+    return last
+
 
 def evaluate_sample(agent_id: str, sample: dict) -> list[dict]:
-    sample_id = sample["sample_id"]
+    sample_id: str = sample["sample_id"]
     safe_id = sample_id.replace("-", "_")
+    qa_list: list[dict] = sample.get("qa", [])
+    date_ctx = _get_date_ctx(sample)
 
     print(f"\n{'='*64}")
     print(f"  Sample : {sample_id}")
-    print(f"  QA 数量: {len(sample.get('qa', []))}")
+    print(f"  QAs    : {len(qa_list)}")
+    if date_ctx:
+        print(f"  Date   : {date_ctx}")
     print(f"{'='*64}")
 
-    print("[1/2] 喂入对话...")
-    last_date_str = feed_conversation(agent_id, safe_id, sample["conversation"])
-
-    print("[2/2] 开始 QA 评测...")
     results: list[dict] = []
-    qa_list = sample.get("qa", [])
+    iter_qa = tqdm(qa_list, desc=f"  {sample_id}") if HAS_TQDM else qa_list
 
-    # QA 阶段使用独立的新 session，agent 从记忆系统中检索作答
-    eval_session_id = f"eval_{safe_id}_{int(time.time())}"
+    for q_idx, qa in enumerate(iter_qa):
+        question: str = qa["question"]
+        expected: str = str(qa["answer"])
+        category: int = qa.get("category", 0)
+        evidence: list = qa.get("evidence", [])
 
-    iter_qa = tqdm(qa_list, desc="  QA") if HAS_TQDM else qa_list
-    for qa in iter_qa:
-        question = qa["question"]
-        expected = str(qa["answer"])
-        category = qa.get("category", 0)
-        evidence = qa.get("evidence", [])
+        # Each QA gets its own fresh session
+        session_id = f"qa_{safe_id}_{q_idx}_{int(time.time())}"
+        prompt = build_qa_prompt(question, date_ctx)
 
-        if last_date_str:
-            prompt = f"Current date: {last_date_str}\nAnswer the question directly: {question}"
-        else:
-            prompt = f"Answer the question directly: {question}"
-
-        got = _sse_chat(
-            agent_id, eval_session_id,
-            prompt,
-            collect_reply=True,
-            timeout=ANSWER_TIMEOUT,
-        )
+        got = _sse_chat(agent_id, session_id, prompt, timeout=ANSWER_TIMEOUT)
         if not got:
             got = "[TIMEOUT/NO_REPLY]"
 
         correct = judge_answer(category, expected, got)
         results.append({
             "sample_id": sample_id,
+            "q_idx": q_idx,
             "category": category,
             "question": question,
             "expected": expected,
@@ -353,17 +314,21 @@ def evaluate_sample(agent_id: str, sample: dict) -> list[dict]:
             "evidence": evidence,
         })
 
-        mark = "✓" if correct else "✗"
+        mark = "V" if correct else "X"
         print(
             f"  [{mark}] Cat{category} | {question[:55]}\n"
-            f"       期望: {expected}\n"
-            f"       回答: {got[:100]}"
+            f"       expected: {expected}\n"
+            f"       got     : {got[:100]}"
         )
+
+        # Clean up the session immediately after each QA
+        delete_session(agent_id, session_id)
+        time.sleep(TURN_DELAY)
 
     return results
 
 
-# ─── 指标统计 ─────────────────────────────────────────────────────────────────
+# --- metrics ---------------------------------------------------------------
 
 def compute_metrics(results: list[dict]) -> dict:
     cat_correct: dict[int, int] = defaultdict(int)
@@ -373,6 +338,7 @@ def compute_metrics(results: list[dict]) -> dict:
         cat_total[cat] += 1
         if r.get("correct"):
             cat_correct[cat] += 1
+
     metrics: dict = {}
     for cat in sorted(cat_total.keys()):
         total = cat_total[cat]
@@ -382,8 +348,9 @@ def compute_metrics(results: list[dict]) -> dict:
             "total": total,
             "accuracy": round(correct / total, 4) if total else 0.0,
         }
+
     total_all = len(results)
-    correct_all = sum(r.get("correct", False) for r in results)
+    correct_all = sum(1 for r in results if r.get("correct"))
     metrics["overall"] = {
         "correct": correct_all,
         "total": total_all,
@@ -394,43 +361,81 @@ def compute_metrics(results: list[dict]) -> dict:
 
 def print_metrics(metrics: dict) -> None:
     cat_labels = {
-        1: "Factual    ", 2: "Temporal   ", 3: "Inferential",
-        4: "General QA ", 5: "Adversarial",
+        1: "Factual    ",
+        2: "Temporal   ",
+        3: "Inferential",
+        4: "General QA ",
+        5: "Adversarial",
     }
     print(f"\n{'='*64}")
-    print("  EVALUATION METRICS")
+    print("  EVALUATION METRICS  (v6)")
     print(f"{'='*64}")
     for key, v in metrics.items():
         if key.startswith("category_"):
             cat_num = int(key.split("_")[1])
-            label = cat_labels.get(cat_num, f"Category {cat_num}")
+            label = cat_labels.get(cat_num, f"Cat {cat_num}    ")
             bar_fill = int(v["accuracy"] * 20)
-            bar = "█" * bar_fill + "░" * (20 - bar_fill)
+            bar = "#" * bar_fill + "." * (20 - bar_fill)
             print(
                 f"  Cat{cat_num} {label} [{bar}] "
                 f"{v['correct']:>2}/{v['total']:>2} = {v['accuracy']:.1%}"
             )
     v = metrics["overall"]
-    print(f"  {'─'*58}")
-    print(f"  Overall                    {v['correct']:>2}/{v['total']:>2} = {v['accuracy']:.1%}")
+    print(f"  {'-'*58}")
+    print(f"  Overall              {v['correct']:>2}/{v['total']:>2} = {v['accuracy']:.1%}")
     print(f"{'='*64}\n")
 
 
-# ─── 主函数 ───────────────────────────────────────────────────────────────────
+# --- save results ----------------------------------------------------------
+
+def save_results(
+    results: list[dict],
+    metrics: dict,
+    results_dir: Path,
+    config: dict,
+) -> None:
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    eval_path = results_dir / "eval_results.json"
+    with open(eval_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {"config": config, "metrics": metrics, "results": results},
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+    print(f"[+] Saved eval results -> {eval_path}")
+
+    metrics_path = results_dir / "metrics.json"
+    with open(metrics_path, "w", encoding="utf-8") as f:
+        json.dump({"config": config, "metrics": metrics}, f, ensure_ascii=False, indent=2)
+    print(f"[+] Saved metrics      -> {metrics_path}")
+
+
+# --- CLI -------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="在 QwenPaw 上评测 LoCoMo 长期记忆数据集")
-    p.add_argument("--data", default="locomo_small.json")
-    p.add_argument("--agent-id", default="locomo_eval")
-    p.add_argument("--output", default="eval_results.json")
-    p.add_argument("--base-url", default=None)
-    p.add_argument("--answer-timeout", type=float, default=ANSWER_TIMEOUT)
-    p.add_argument("--delete-after", action="store_true")
+    p = argparse.ArgumentParser(
+        description="Evaluate LoCoMo benchmark on QwenPaw (v6 - pure QA)"
+    )
+    p.add_argument("--data", default="locomo_small.json",
+                   help="Path to LoCoMo JSON dataset")
+    p.add_argument("--agent-id", default="locomo_eval",
+                   help="QwenPaw agent ID to use")
+    p.add_argument("--results-dir", default="results",
+                   help="Directory for output JSON files")
+    p.add_argument("--base-url", default=None,
+                   help="Override QWENPAW_BASE_URL")
+    p.add_argument("--answer-timeout", type=float, default=ANSWER_TIMEOUT,
+                   help="SSE stream timeout in seconds")
+    p.add_argument("--delete-after", action="store_true",
+                   help="Delete the agent after evaluation")
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+
     global BASE_URL, ANSWER_TIMEOUT, REQUEST_TIMEOUT
     if args.base_url:
         BASE_URL = args.base_url
@@ -438,74 +443,71 @@ def main() -> None:
     REQUEST_TIMEOUT = int(ANSWER_TIMEOUT) + 10
 
     print("=" * 64)
-    print("  LoCoMo × QwenPaw 评测  (v4 — 自然语言记忆注入版)")
+    print("  LoCoMo x QwenPaw Evaluation  (v6 -- pure QA)")
     print("=" * 64)
-    print(f"  API 地址 : {BASE_URL}")
-    print(f"  认证     : {'Bearer Token' if API_USER else '无（pip 本地部署）'}")
-    print(f"  数据文件 : {args.data}")
-    print(f"  Agent ID : {args.agent_id}")
-    print(f"  输出文件 : {args.output}")
-    print(f"  SSE 超时 : {ANSWER_TIMEOUT}s")
+    print(f"  API URL     : {BASE_URL}")
+    print(f"  Auth        : {'Bearer Token' if API_USER else 'none (local pip deploy)'}")
+    print(f"  Data file   : {args.data}")
+    print(f"  Agent ID    : {args.agent_id}")
+    print(f"  Results dir : {args.results_dir}")
+    print(f"  SSE timeout : {ANSWER_TIMEOUT}s")
     print("=" * 64)
 
-    # 登录
+    # auth
     if API_USER:
-        print(f"\n[Auth] 正在登录（用户：{API_USER}）...")
+        print(f"\n[Auth] Logging in as {API_USER} ...")
         if not _login():
-            print("[ERROR] 登录失败，请检查 QWENPAW_API_USER / QWENPAW_API_PASS")
+            print("[ERROR] Login failed. Check QWENPAW_API_USER / QWENPAW_API_PASS.")
             raise SystemExit(1)
 
-    # 连通性检查
+    # connectivity check
     try:
-        requests.get(f"{BASE_URL}/agents", headers=_base_headers(), timeout=10)
+        requests.get(f"{BASE_URL}/agents", headers=_headers(), timeout=10)
     except requests.exceptions.ConnectionError:
-        print(f"\n[ERROR] 无法连接到 QwenPaw: {BASE_URL}")
+        print(f"\n[ERROR] Cannot reach QwenPaw at {BASE_URL}")
         raise SystemExit(1)
 
-    # 读取数据集
+    # load dataset
     data_path = Path(args.data)
     if not data_path.exists():
-        print(f"[ERROR] 数据文件不存在: {data_path}")
+        print(f"[ERROR] Data file not found: {data_path}")
         raise SystemExit(1)
     with open(data_path, encoding="utf-8") as f:
         dataset: list[dict] = json.load(f)
-    print(f"\n已加载 {len(dataset)} 个样本\n")
+    print(f"\nLoaded {len(dataset)} samples\n")
 
-    # 创建 agent
-    agent_id = create_eval_agent(args.agent_id)
+    # ensure agent exists
+    agent_id = ensure_agent(args.agent_id)
 
-    # 评测
+    # run evaluation
     all_results: list[dict] = []
     try:
         for sample in dataset:
-            results = evaluate_sample(agent_id, sample)
-            all_results.extend(results)
+            sample_results = evaluate_sample(agent_id, sample)
+            all_results.extend(sample_results)
     finally:
         if all_results:
             metrics = compute_metrics(all_results)
-            out_data = {
-                "config": {
-                    "base_url": BASE_URL,
-                    "agent_id": agent_id,
-                    "data_file": str(data_path),
-                    "answer_timeout": ANSWER_TIMEOUT,
-                },
-                "metrics": metrics,
-                "results": all_results,
+            config = {
+                "version": "v6",
+                "base_url": BASE_URL,
+                "agent_id": agent_id,
+                "data_file": str(data_path),
+                "answer_timeout": ANSWER_TIMEOUT,
             }
-            out_path = Path(args.output)
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(out_path, "w", encoding="utf-8") as f:
-                json.dump(out_data, f, ensure_ascii=False, indent=2)
+            save_results(all_results, metrics, Path(args.results_dir), config)
             print_metrics(metrics)
-            print(f"[✓] 结果已保存到 {out_path}")
 
         if args.delete_after:
-            requests.delete(
-                f"{BASE_URL}/agents/{agent_id}",
-                headers=_base_headers(),
-                timeout=10,
-            )
+            try:
+                requests.delete(
+                    f"{BASE_URL}/agents/{agent_id}",
+                    headers=_headers(),
+                    timeout=10,
+                )
+                print(f"[+] Agent '{agent_id}' deleted")
+            except requests.exceptions.RequestException:
+                pass
 
 
 if __name__ == "__main__":
