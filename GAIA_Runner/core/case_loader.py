@@ -5,7 +5,7 @@ import os
 import pandas as pd
 from typing import List, Optional
 from pathlib import Path
-from .models import GAIACase
+from core.models import GAIACase
 
 
 class GAIACaseLoader:

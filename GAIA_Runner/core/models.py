@@ -164,3 +164,37 @@ class ExecutionTrace:
             "context_metrics": asdict(self.context_metrics),
             "difficulty_metrics": asdict(self.difficulty_metrics),
         }
+
+
+@dataclass
+class AnalysisResult:
+    """分析结果"""
+    case_id: str
+    level: int
+    difficulty_score: float = 0.0
+    tool_diversity: float = 0.0
+    tool_reuse_rate: float = 0.0
+    tool_failure_rate: float = 0.0
+    peak_context: int = 0
+    avg_context: int = 0
+    compression_count: int = 0
+    compression_rate: float = 0.0
+
+    def to_dict(self) -> dict:
+        """转换为字典"""
+        return asdict(self)
+
+
+@dataclass
+class Metrics:
+    """聚合指标"""
+    total_cases: int = 0
+    successful_cases: int = 0
+    success_rate: float = 0.0
+    avg_difficulty: float = 0.0
+    total_events: int = 0
+    total_duration: float = 0.0
+
+    def to_dict(self) -> dict:
+        """转换为字典"""
+        return asdict(self)

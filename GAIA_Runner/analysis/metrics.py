@@ -3,7 +3,7 @@
 
 from typing import List, Dict, Any
 from collections import defaultdict
-from ..core.models import ExecutionTrace, EventType
+from core.models import ExecutionTrace, EventType
 
 
 def calculate_tool_metrics(trace: ExecutionTrace) -> Dict[str, Any]:

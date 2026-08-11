@@ -4,7 +4,7 @@
 from typing import List, Dict, Any
 from collections import defaultdict
 from .metrics import calculate_all_metrics
-from ..core.models import ExecutionTrace, AnalysisResult
+from core.models import ExecutionTrace, AnalysisResult
 
 
 class Analyzer:

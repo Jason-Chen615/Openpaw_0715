@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from collections import defaultdict
-from .models import TraceEvent, EventType, ExecutionTrace, GAIACase
+from core.models import TraceEvent, EventType, ExecutionTrace, GAIACase
 
 
 class TraceCollector:
@@ -79,6 +79,7 @@ class TraceCollector:
             EventType.TOOL_CALL,
             iteration,
             {'tool_name': tool_name, 'args': args, 'duration': duration}
+        )
 
     def record_tool_result(
         self,
@@ -222,4 +223,4 @@ class TraceCollector:
         
         return summary
 
-        )
+        

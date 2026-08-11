@@ -5,8 +5,8 @@ import json
 from pathlib import Path
 from typing import List, Dict, Any
 from datetime import datetime
-from .analyzer import Analyzer
-from ..core.models import ExecutionTrace
+from analysis.analyzer import Analyzer
+from core.models import ExecutionTrace
 
 
 class ReportGenerator:

@@ -5,8 +5,8 @@ import time
 import logging
 from typing import Optional
 from .execution_env import ExecutionEnvironment
-from ..core.models import GAIACase, ExecutionTrace
-from ..core.trace_collector import TraceCollector
+from core.models import GAIACase, ExecutionTrace
+from core.trace_collector import TraceCollector
 
 logger = logging.getLogger(__name__)
 
