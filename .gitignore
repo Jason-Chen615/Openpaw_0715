@@ -149,3 +149,17 @@ e2e/__pycache__/
 graphify-out/
 local-docs/
 docs-site/
+
+
+
+# GAIA dataset
+dataset/
+
+# HuggingFace cache
+.cache/
+
+# Experiment results
+results/
+
+# Logs
+logs/
