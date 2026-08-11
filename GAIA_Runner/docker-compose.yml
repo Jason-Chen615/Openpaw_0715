@@ -1,0 +1,45 @@
+version: '3.8'
+
+services:
+  qwenpaw_gaia:
+    image: qwenpaw:latest
+    container_name: qwenpaw_gaia
+    hostname: qwenpaw-gaia
+    ports:
+      - "8089:8088"  # 与LoCoMo的8088端口隔离，使用8089
+    environment:
+      - QWENPAW_AUTH_ENABLED=${QWENPAW_AUTH_ENABLED:-true}
+      - QWENPAW_AUTH_USERNAME=${QWENPAW_AUTH_USERNAME:-admin}
+      - QWENPAW_AUTH_PASSWORD=${QWENPAW_AUTH_PASSWORD:-password}
+      - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY}
+      - QWENPAW_DATA_DIR=/data/gaia
+      - QWENPAW_LOG_DIR=/logs
+      - QWENPAW_CACHE_DIR=/cache
+    volumes:
+      # 数据集挂载
+      - ./dataset/GAIA:/data/gaia:ro
+      # 结果输出
+      - ./GAIA_Runner/outputs:/app/gaia_outputs
+      # 日志
+      - ./GAIA_Runner/logs:/logs
+      # 缓存
+      - ./GAIA_Runner/cache:/cache
+    networks:
+      - gaia_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-u", "${QWENPAW_AUTH_USERNAME:-admin}:${QWENPAW_AUTH_PASSWORD:-password}", "http://localhost:8088/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  gaia_network:
+    driver: bridge
+    name: gaia_network
