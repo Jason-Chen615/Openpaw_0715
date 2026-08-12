@@ -126,45 +126,32 @@ class AgentRunner:
         # 准备请求
         session_id = f"gaia-{case.task_id}"
         
-        # 构建消息内容
-        content = []
+        # 构建问题文本
+        question_text = case.question
         
-        # 添加文本
-        content.append({
-            "type": "text",
-            "text": case.question
-        })
-        
-        # 如果有附件，添加文件
+        # 如果有附件，将文件路径作为文本上下文注入prompt
         if case.has_attachment():
             host_file_path = self.env.dataset_root / case.file_path
             if host_file_path.exists():
                 logger.info(f"附件存在: {host_file_path}")
                 
-                # 容器内的文件路径（发送给QwenPaw）
-                # 因为挂载是 ../dataset/GAIA:/data/gaia:ro
-                # 需要将Windows路径转换为Unix路径
+                # 容器内的文件路径
                 container_file_path = f"/data/gaia/{str(case.file_path).replace(chr(92), '/')}"
                 logger.info(f"容器内路径: {container_file_path}")
                 
-                try:
-                    with open(host_file_path, 'rb') as f:
-                        file_content = f.read()
-                    
-                    logger.info(f"文件大小: {len(file_content)} bytes")
-                    
-                    # 根据文件类型添加
-                    if host_file_path.suffix.lower() in ['.pdf', '.txt', '.md', '.xlsx', '.csv']:
-                        content.append({
-                            "type": "file",
-                            "file_name": host_file_path.name,
-                            "file_path": container_file_path
-                        })
-                        logger.info(f"添加附件: {host_file_path.name}")
-                except Exception as e:
-                    logger.warning(f"处理文件失败: {e}")
+                # 将文件路径注入问题文本中，让Agent主动读取
+                question_text += f"\n\nPlease read and analyze the file located at: {container_file_path}"
+                logger.info(f"已将文件路径注入prompt")
             else:
                 logger.warning(f"附件不存在: {host_file_path}")
+        
+        # 构建消息内容 - 只包含文本，不使用type=file
+        content = [
+            {
+                "type": "text",
+                "text": question_text
+            }
+        ]
         
         # 构建请求体
         request_body = {
@@ -184,7 +171,7 @@ class AgentRunner:
         try:
             logger.info(f"发送请求到: {chat_endpoint}")
             logger.info(f"Session ID: {session_id}")
-            logger.info(f"问题: {case.question[:100]}...")
+            logger.info(f"问题: {question_text[:100]}...")
             
             response = self.session.post(
                 chat_endpoint,
