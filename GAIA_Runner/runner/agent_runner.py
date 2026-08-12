@@ -70,6 +70,42 @@ class AgentRunner:
         except Exception as e:
             logger.error(f"设置会话失败: {str(e)}", exc_info=True)
             raise
+    def ensure_agent(self) -> None:
+        """
+        确保指定的agent存在，不存在则自动创建
+        如果agent已存在，则复用
+        """
+        if not self.session:
+            self.setup_session()
+        
+        agent_id = self.env.agent_id
+        create_url = f"{self.env.qwenpaw_base_url}/agents"
+        
+        try:
+            logger.info(f"正在检查agent '{agent_id}'...")
+            response = self.session.post(
+                create_url,
+                json={
+                    "id": agent_id,
+                    "name": f"GAIA Agent - {agent_id}",
+                    "description": "Automated agent for GAIA benchmark evaluation.",
+                    "language": "en",
+                },
+                timeout=30
+            )
+            
+            if response.status_code == 201:
+                logger.info(f"✓ Agent '{agent_id}' 已创建")
+            elif response.status_code in (400, 409):
+                logger.info(f"✓ Agent '{agent_id}' 已存在，复用中...")
+            else:
+                logger.warning(f"创建agent时收到意外状态码: {response.status_code}")
+                logger.warning(f"响应: {response.text[:200]}")
+        except Exception as e:
+            logger.error(f"确保agent失败: {str(e)}", exc_info=True)
+            raise
+
+
 
     def execute_case(self, case: GAIACase) -> ExecutionTrace:
         """
@@ -82,6 +118,10 @@ class AgentRunner:
             执行轨迹
         """
         logger.info(f"开始执行case: {case.task_id} (Level {case.level})")
+        # 确保agent存在（如果不存在则自动创建）
+        self.ensure_agent()
+        
+
         
         # 开始记录
         trace = self.collector.start_case(case.task_id, case.level, case)
