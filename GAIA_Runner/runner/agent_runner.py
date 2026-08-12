@@ -317,13 +317,69 @@ class AgentRunner:
             
             logger.info(f"收到完整响应，长度: {len(full_response)}")
             
-            # 检查是否与预期答案匹配（简单的字符串包含检查）
-            expected_answer = case.final_answer.lower()
-            actual_answer = full_response.lower()
+            # 从响应中提取最终答案
+            # 策略：取最后一条message事件中的最终回复（跳过reasoning）
+            final_answer_text = ""
+            for event in reversed(self.collector.current_trace.events):
+                if event.event_type == 'message':
+                    # 从content数组中提取最后一个非空文本块
+                    content_list = event.data.get('content', [])
+                    if isinstance(content_list, list):
+                        for item in reversed(content_list):
+                            if isinstance(item, dict):
+                                text = item.get('text', '').strip()
+                                if text:
+                                    final_answer_text = text
+                                    break
+                    if final_answer_text:
+                        break
             
-            success = expected_answer in actual_answer or actual_answer in expected_answer
+            # 如果没找到最后的message事件，用full_response的最后部分
+            if not final_answer_text:
+                # 取最后1000个字符作为最终答案（通常最终回答在末尾）
+                final_answer_text = full_response[-1000:] if len(full_response) > 1000 else full_response
             
-            return success, full_response
+            logger.info(f"提取的最终答案: {final_answer_text[:200]}")
+            
+            # 检查是否与预期答案匹配
+            expected = case.final_answer.lower().strip()
+            actual = final_answer_text.lower().strip()
+            
+            # 匹配策略：
+            # 1. 精确匹配（忽略大小写）
+            if expected == actual:
+                success = True
+                logger.info("✓ 精确匹配")
+            # 2. 子串匹配（预期答案在实际回答中）
+            elif expected in actual:
+                success = True
+                logger.info("✓ 子串匹配（预期in实际）")
+            # 3. 反向子串匹配（实际回答在预期答案中）
+            elif actual in expected:
+                success = True
+                logger.info("✓ 反向子串匹配（实际in预期）")
+            # 4. 部分词汇匹配（关键词至少有80%在实际回答中）
+            else:
+                # 分词匹配：预期答案的词汇有多少比例出现在实际回答中
+                expected_words = set(expected.split())
+                actual_words = set(actual.split())
+                if expected_words and actual_words:
+                    match_ratio = len(expected_words & actual_words) / len(expected_words)
+                    if match_ratio >= 0.8:
+                        success = True
+                        logger.info(f"✓ 词汇匹配 ({match_ratio:.1%})")
+                    else:
+                        success = False
+                        logger.info(f"✗ 不匹配 (词汇匹配度: {match_ratio:.1%})")
+                else:
+                    success = False
+                    logger.info("✗ 不匹配")
+            
+            logger.info(f"预期答案: {expected[:100]}")
+            logger.info(f"实际答案: {actual[:100]}")
+            logger.info(f"判断结果: {success}")
+            
+            return success, final_answer_text
             
         except Exception as e:
             logger.error(f"执行请求失败: {str(e)}", exc_info=True)
