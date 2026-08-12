@@ -6,6 +6,7 @@ import logging
 import json
 from typing import Optional
 from pathlib import Path
+from datetime import datetime
 from .execution_env import ExecutionEnvironment
 from .resource_monitor import ResourceMonitor
 from core.models import GAIACase, ExecutionTrace, EventType
@@ -243,6 +244,7 @@ class AgentRunner:
                                         'text_chunk',
                                         iteration,
                                         {
+                                            'timestamp': datetime.now().isoformat(),
                                             'text': text_chunk,
                                             'sequence_number': event_data.get('sequence_number'),
                                             'delta': event_data.get('delta')
@@ -254,11 +256,14 @@ class AgentRunner:
                                 plugin_name = event_data.get('plugin_name', 'unknown')
                                 plugin_args = event_data.get('args', {})
                                 logger.info(f"[工具调用] {plugin_name}")
-                                self.collector.record_tool_call(
+                                self.collector.record_event(
+                                    'plugin_call',
                                     iteration,
-                                    plugin_name,
-                                    plugin_args,
-                                    duration=0.0
+                                    {
+                                        'timestamp': datetime.now().isoformat(),
+                                        'plugin_name': plugin_name,
+                                        'args': plugin_args
+                                    }
                                 )
                             
                             # plugin_call_output - 工具结果
@@ -268,12 +273,16 @@ class AgentRunner:
                                 status = 'success' if not event_data.get('error') else 'failure'
                                 error_msg = event_data.get('error')
                                 logger.info(f"[工具结果] {plugin_name} - {status}")
-                                self.collector.record_tool_result(
+                                self.collector.record_event(
+                                    'plugin_call_output',
                                     iteration,
-                                    plugin_name,
-                                    output,
-                                    status=status,
-                                    error=error_msg
+                                    {
+                                        'timestamp': datetime.now().isoformat(),
+                                        'plugin_name': plugin_name,
+                                        'output': output,
+                                        'status': status,
+                                        'error': error_msg
+                                    }
                                 )
                         
                         # ===== 处理完整消息 (object="message") =====
@@ -299,6 +308,7 @@ class AgentRunner:
                                         'reasoning',
                                         iteration,
                                         {
+                                            'timestamp': datetime.now().isoformat(),
                                             'text': reasoning_text,
                                             'msg_id': event_data.get('msg_id')
                                         }
