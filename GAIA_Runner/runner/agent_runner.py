@@ -7,7 +7,7 @@ import json
 from typing import Optional
 from pathlib import Path
 from .execution_env import ExecutionEnvironment
-from core.models import GAIACase, ExecutionTrace
+from core.models import GAIACase, ExecutionTrace, EventType
 from core.trace_collector import TraceCollector
 
 logger = logging.getLogger(__name__)
@@ -198,12 +198,10 @@ class AgentRunner:
                 logger.error(f"响应: {response.text}")
                 return False, None
             
-            # 处理SSE流
-            # 根据真实payload格式修复，结构为：
-            # - 流式文本块: {"sequence_number":N, "object":"content", "type":"text", "text":"..."}
-            # - 完整消息: {"sequence_number":N, "object":"message", "content":[{"text":"..."}]}
+            # 处理SSE流 - 完整捕获Agent执行轨迹
             iteration = 1
             full_response = ""
+            turn_start_time = time.time()
             
             self.collector.record_turn_start(iteration, case.question, len(json.dumps(request_body)))
             
@@ -217,71 +215,96 @@ class AgentRunner:
                 if line.startswith('data: '):
                     try:
                         event_data = json.loads(line[6:])  # 移除 "data: " 前缀
-                        obj_type = event_data.get('object')  # 区分 'content' 和 'message'
+                        obj_type = event_data.get('object')
+                        event_type = event_data.get('type')
                         
                         # ===== 处理流式内容块 (object="content") =====
                         if obj_type == 'content':
-                            event_type = event_data.get('type')
-                            
-                            # 文本块：直接从 'text' 字段提取（不是 'content'）
+                            # 文本块
                             if event_type == 'text':
                                 text_chunk = event_data.get('text', '')
-                                if text_chunk:  # 只有非空才追加
+                                if text_chunk:
                                     full_response += text_chunk
-                                    logger.debug(f"收到文本块 (delta={event_data.get('delta')}): {text_chunk[:100]}")
+                                    logger.debug(f"[文本] {text_chunk[:80]}")
+                                    # 记录文本事件
+                                    self.collector.record_event(
+                                        'text_chunk',
+                                        iteration,
+                                        {
+                                            'text': text_chunk,
+                                            'sequence_number': event_data.get('sequence_number'),
+                                            'delta': event_data.get('delta')
+                                        }
+                                    )
                             
-                            # 工具调用事件
-                            elif event_type == 'tool_call':
-                                tool_name = event_data.get('tool_name', 'unknown')
-                                tool_args = event_data.get('arguments', {})
+                            # plugin_call - 工具调用开始
+                            elif event_type == 'plugin_call':
+                                plugin_name = event_data.get('plugin_name', 'unknown')
+                                plugin_args = event_data.get('args', {})
+                                logger.info(f"[工具调用] {plugin_name}")
                                 self.collector.record_tool_call(
                                     iteration,
-                                    tool_name,
-                                    tool_args
+                                    plugin_name,
+                                    plugin_args,
+                                    duration=0.0
                                 )
-                                logger.info(f"工具调用: {tool_name}")
                             
-                            # 工具结果事件
-                            elif event_type == 'tool_result':
-                                tool_name = event_data.get('tool_name', 'unknown')
-                                result = event_data.get('result', '')
-                                status = event_data.get('status', 'success')
+                            # plugin_call_output - 工具结果
+                            elif event_type == 'plugin_call_output':
+                                plugin_name = event_data.get('plugin_name', 'unknown')
+                                output = event_data.get('output', '')
+                                status = 'success' if not event_data.get('error') else 'failure'
+                                error_msg = event_data.get('error')
+                                logger.info(f"[工具结果] {plugin_name} - {status}")
                                 self.collector.record_tool_result(
                                     iteration,
-                                    tool_name,
-                                    result,
-                                    status
+                                    plugin_name,
+                                    output,
+                                    status=status,
+                                    error=error_msg
                                 )
-                                logger.info(f"工具结果: {tool_name} - {status}")
                         
                         # ===== 处理完整消息 (object="message") =====
                         elif obj_type == 'message':
-                            msg_type = event_data.get('type')
-                            
-                            if msg_type == 'message':
-                                # 从 content 数组中提取所有文本块
+                            # message类型 - 最终回复
+                            if event_type == 'message':
                                 content_list = event_data.get('content', [])
                                 if isinstance(content_list, list):
                                     for content_item in content_list:
                                         if isinstance(content_item, dict):
                                             item_text = content_item.get('text', '')
-                                            if item_text:  # 只有非空才追加
+                                            if item_text:
                                                 full_response += item_text
-                                                logger.debug(f"收到完整消息文本块: {item_text[:100]}")
+                                                logger.debug(f"[消息] {item_text[:80]}")
                             
-                            elif msg_type == 'reasoning':
-                                # reasoning 消息，通常是中间推理过程，可选记录
+                            # reasoning类型 - 推理过程
+                            elif event_type == 'reasoning':
                                 reasoning_text = event_data.get('text', '')
                                 if reasoning_text:
-                                    logger.debug(f"推理过程: {reasoning_text[:100]}")
+                                    logger.debug(f"[推理] {reasoning_text[:80]}")
+                                    # 记录推理事件用于后续分析
+                                    self.collector.record_event(
+                                        'reasoning',
+                                        iteration,
+                                        {
+                                            'text': reasoning_text,
+                                            'msg_id': event_data.get('msg_id')
+                                        }
+                                    )
                         
-                        # ===== 处理响应完成 =====
-                        elif event_data.get('status') == 'completed':
-                            # 某些事件用 status="completed" 标记完成
-                            logger.debug(f"事件标记为完成: {obj_type}")
+                        # ===== 处理其他系统事件 =====
+                        elif obj_type == 'response':
+                            # 响应级别事件
+                            resp_status = event_data.get('status')
+                            if resp_status == 'completed':
+                                logger.info(f"[响应完成] 耗时 {event_data.get('completed_at', 0) - event_data.get('created_at', 0)}ms")
+                        
+                        elif obj_type == 'turn_usage':
+                            # 使用统计
+                            logger.debug(f"[统计] {event_data}")
                         
                     except json.JSONDecodeError as e:
-                        logger.debug(f"无法解析SSE数据: {line[:100]}")
+                        logger.debug(f"SSE解析失败: {line[:100]}")
                         continue
             
             # 记录Turn结束

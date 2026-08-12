@@ -30,14 +30,20 @@ class TraceCollector:
         )
         return self.current_trace
 
-    def record_event(self, event_type: EventType, iteration: int, data: Dict[str, Any]) -> None:
-        """记录一个事件"""
+    def record_event(self, event_type, iteration: int, data: Dict[str, Any]) -> None:
+        """记录一个事件（支持EventType枚举或字符串）"""
         if self.current_trace is None:
             raise RuntimeError("未启动case记录")
         
+        # 支持EventType枚举或字符串类型
+        if isinstance(event_type, EventType):
+            event_type_str = event_type.value
+        else:
+            event_type_str = str(event_type)
+        
         event = TraceEvent(
             timestamp=time.time(),
-            event_type=event_type.value,
+            event_type=event_type_str,
             iteration=iteration,
             case_id=self.current_trace.case_id,
             level=self.current_trace.level,

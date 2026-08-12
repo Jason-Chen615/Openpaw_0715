@@ -19,16 +19,32 @@ def calculate_tool_metrics(trace: ExecutionTrace) -> Dict[str, Any]:
     tool_calls = defaultdict(lambda: {'count': 0, 'success': 0, 'errors': 0})
     
     for event in trace.events:
-        if event.event_type == EventType.TOOL_CALL.value:
+        # 支持EventType枚举和字符串类型
+        event_type = event.event_type
+        
+        if event_type == EventType.TOOL_CALL.value or event_type == 'tool_call':
             tool_name = event.data.get('tool_name')
             tool_calls[tool_name]['count'] += 1
-        elif event.event_type == EventType.TOOL_RESULT.value:
+        elif event_type == EventType.TOOL_RESULT.value or event_type == 'tool_result':
             tool_name = event.data.get('tool_name')
             status = event.data.get('status', 'success')
             if status == 'success':
                 tool_calls[tool_name]['success'] += 1
             else:
                 tool_calls[tool_name]['errors'] += 1
+        # 新增：支持plugin_call和plugin_call_output（QwenPaw的原始事件名）
+        elif event_type == 'plugin_call':
+            tool_name = event.data.get('plugin_name')
+            if tool_name:
+                tool_calls[tool_name]['count'] += 1
+        elif event_type == 'plugin_call_output':
+            tool_name = event.data.get('plugin_name')
+            status = event.data.get('status', 'success')
+            if tool_name:
+                if status == 'success':
+                    tool_calls[tool_name]['success'] += 1
+                else:
+                    tool_calls[tool_name]['errors'] += 1
     
     # 计算聚合指标
     total_tools = len(tool_calls)
