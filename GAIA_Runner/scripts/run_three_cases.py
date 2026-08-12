@@ -84,7 +84,7 @@ def main():
         runner = AgentRunner(env, collector)
         
         # Ensure the specified agent exists
-        runner.ensure_agent_exists()
+        runner.ensure_agent()
         # 4. 执行案例
         traces = []
         for level in sorted(representative_cases.keys()):
