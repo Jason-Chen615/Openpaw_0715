@@ -29,15 +29,44 @@ class AgentRunner:
         self.session = None
 
     def setup_session(self) -> None:
-        """设置HTTP会话"""
+        """设置HTTP会话，包括登录获取token"""
         try:
             import requests
             self.session = requests.Session()
+            
+            # 先尝试登录获取token
+            login_url = f"{self.env.qwenpaw_base_url}/auth/login"
+            login_data = {
+                "username": self.env.api_username,
+                "password": self.env.api_password,
+                "expires_in": -1  # 永久token
+            }
+            
+            logger.info(f"正在登录: {login_url}")
+            response = self.session.post(login_url, json=login_data, timeout=10)
+            
+            if response.status_code == 200:
+                token_response = response.json()
+                token = token_response.get('token')
+                if token:
+                    self.env.set_bearer_token(token)
+                    logger.info(f"登录成功，获得token: {token[:20]}...")
+                else:
+                    logger.warning("登录响应中没有token字段")
+            else:
+                logger.warning(f"登录失败: {response.status_code} {response.text}")
+            
+            # 设置认证头
             headers = self.env.get_auth_headers()
             self.session.headers.update(headers)
+            self.session.headers['Content-Type'] = 'application/json'
+            
             logger.info(f"已连接到 {self.env.qwenpaw_base_url}")
         except ImportError:
             logger.error("需要安装 requests 库")
+            raise
+        except Exception as e:
+            logger.error(f"设置会话失败: {str(e)}", exc_info=True)
             raise
 
     def execute_case(self, case: GAIACase) -> ExecutionTrace:

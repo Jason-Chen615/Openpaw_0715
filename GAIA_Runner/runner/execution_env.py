@@ -37,6 +37,8 @@ class ExecutionEnvironment:
         if dataset_root is None:
             dataset_root = os.getenv('GAIA_DATASET_ROOT', 'dataset/GAIA')
         self.dataset_root = Path(dataset_root)
+        
+        self.bearer_token: Optional[str] = None
 
     def is_available(self) -> bool:
         """检查环境是否可用"""
@@ -51,11 +53,14 @@ class ExecutionEnvironment:
         return f"{self.qwenpaw_base_url}/../healthz"
 
     def get_auth_headers(self) -> Dict[str, str]:
-        """获取认证请求头"""
-        import base64
-        credentials = f"{self.api_username}:{self.api_password}"
-        encoded = base64.b64encode(credentials.encode()).decode()
-        return {'Authorization': f'Basic {encoded}'}
+        """获取认证请求头 - 使用Bearer Token"""
+        if self.bearer_token:
+            return {'Authorization': f'Bearer {self.bearer_token}'}
+        return {}
+    
+    def set_bearer_token(self, token: str) -> None:
+        """设置Bearer token"""
+        self.bearer_token = token
 
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
