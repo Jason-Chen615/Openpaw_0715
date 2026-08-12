@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """Agent执行器"""
 
 import time
@@ -217,12 +217,18 @@ class AgentRunner:
             turn_start_time = time.time()
             
             self.collector.record_turn_start(iteration, case.question, len(json.dumps(request_body)))
+            # 初始化raw_sse文件
+            self.collector.init_raw_sse_file()
+
             
             for line in response.iter_lines():
                 if not line:
                     continue
                 
                 line = line.decode('utf-8') if isinstance(line, bytes) else line
+                
+                # 记录原始SSE流（包含时间戳）
+                self.collector.record_raw_sse(line)
                 
                 # 处理SSE格式: "data: {...}"
                 if line.startswith('data: '):
@@ -244,7 +250,6 @@ class AgentRunner:
                                         'text_chunk',
                                         iteration,
                                         {
-                                            'timestamp': datetime.now().isoformat(),
                                             'text': text_chunk,
                                             'sequence_number': event_data.get('sequence_number'),
                                             'delta': event_data.get('delta')
@@ -260,7 +265,6 @@ class AgentRunner:
                                     'plugin_call',
                                     iteration,
                                     {
-                                        'timestamp': datetime.now().isoformat(),
                                         'plugin_name': plugin_name,
                                         'args': plugin_args
                                     }
@@ -277,7 +281,6 @@ class AgentRunner:
                                     'plugin_call_output',
                                     iteration,
                                     {
-                                        'timestamp': datetime.now().isoformat(),
                                         'plugin_name': plugin_name,
                                         'output': output,
                                         'status': status,
@@ -308,7 +311,6 @@ class AgentRunner:
                                         'reasoning',
                                         iteration,
                                         {
-                                            'timestamp': datetime.now().isoformat(),
                                             'text': reasoning_text,
                                             'msg_id': event_data.get('msg_id')
                                         }
@@ -412,3 +414,4 @@ class AgentRunner:
         if self.session:
             self.session.close()
             logger.info("会话已关闭")
+

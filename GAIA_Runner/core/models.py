@@ -28,6 +28,13 @@ class TraceEvent:
     case_id: str
     level: int
     data: dict[str, Any] = field(default_factory=dict)
+    iso_timestamp: str = ""  # ISO格式的时间戳，便于阅读
+
+    def __post_init__(self):
+        """初始化后自动生成ISO时间戳"""
+        if not self.iso_timestamp:
+            from datetime import datetime
+            self.iso_timestamp = datetime.fromtimestamp(self.timestamp).isoformat()
 
     def to_json(self) -> str:
         """转换为JSON行"""

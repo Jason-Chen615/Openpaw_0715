@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from collections import defaultdict
+from datetime import datetime
 from core.models import TraceEvent, EventType, ExecutionTrace, GAIACase
 
 
@@ -19,6 +20,7 @@ class TraceCollector:
         self.traces_dir.mkdir(parents=True, exist_ok=True)
         self.current_trace: Optional[ExecutionTrace] = None
         self.all_traces: List[ExecutionTrace] = []
+        self.raw_sse_file: Optional[Path] = None  # 原始SSE流文件句柄
 
     def start_case(self, case_id: str, level: int, case: GAIACase) -> ExecutionTrace:
         """开始记录一个case"""
@@ -145,6 +147,28 @@ class TraceCollector:
             }
         )
 
+    def init_raw_sse_file(self) -> None:
+        """初始化原始SSE流文件"""
+        if self.current_trace is None:
+            raise RuntimeError("未启动case记录")
+        
+        self.raw_sse_file = self.traces_dir / f"{self.current_trace.case_id}_level{self.current_trace.level}_raw_sse.txt"
+        # 如果文件已存在则覆盖
+        with open(self.raw_sse_file, 'w', encoding='utf-8') as f:
+            f.write(f"=== Raw SSE Stream for case {self.current_trace.case_id} (Level {self.current_trace.level}) ===\n")
+            f.write(f"Started at: {datetime.now().isoformat()}\n")
+            f.write("=" * 80 + "\n\n")
+
+    def record_raw_sse(self, sse_line: str) -> None:
+        """记录原始SSE流中的一条消息"""
+        if self.raw_sse_file is None:
+            self.init_raw_sse_file()
+        
+        # 添加时间戳标记每条SSE消息
+        timestamp = datetime.now().isoformat()
+        with open(self.raw_sse_file, 'a', encoding='utf-8') as f:
+            f.write(f"[{timestamp}] {sse_line}\n")
+
     def end_case(
         self,
         success: bool = False,
@@ -162,6 +186,15 @@ class TraceCollector:
         
         self._save_trace(self.current_trace)
         self.all_traces.append(self.current_trace)
+        
+        # 关闭SSE文件
+        if self.raw_sse_file is not None:
+            with open(self.raw_sse_file, 'a', encoding='utf-8') as f:
+                f.write("\n" + "=" * 80 + "\n")
+                f.write(f"Ended at: {datetime.now().isoformat()}\n")
+                f.write(f"Duration: {self.current_trace.duration:.2f}s\n")
+                f.write(f"Success: {success}\n")
+            self.raw_sse_file = None
         
         trace = self.current_trace
         self.current_trace = None
