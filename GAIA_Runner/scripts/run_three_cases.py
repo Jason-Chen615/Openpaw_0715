@@ -83,6 +83,8 @@ def main():
         collector = TraceCollector(args.output_dir)
         runner = AgentRunner(env, collector)
         
+        # Ensure the specified agent exists
+        runner.ensure_agent_exists()
         # 4. 执行案例
         traces = []
         for level in sorted(representative_cases.keys()):
