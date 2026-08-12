@@ -3,7 +3,9 @@
 
 import time
 import logging
+import json
 from typing import Optional
+from pathlib import Path
 from .execution_env import ExecutionEnvironment
 from core.models import GAIACase, ExecutionTrace
 from core.trace_collector import TraceCollector
@@ -54,13 +56,12 @@ class AgentRunner:
         trace = self.collector.start_case(case.task_id, case.level, case)
         
         try:
-            # 这里实现实际的Agent执行逻辑
-            # 目前是模拟执行
-            success = self._simulate_execution(case, trace)
+            # 执行实际的Agent请求
+            success, final_answer = self._simulate_execution(case, trace)
             
             trace = self.collector.end_case(
                 success=success,
-                final_answer=case.final_answer if success else None,
+                final_answer=final_answer if success else None,
                 error=None if success else "执行失败"
             )
             
@@ -72,60 +73,174 @@ class AgentRunner:
             return trace
             
         except Exception as e:
-            logger.error(f"执行case失败: {case.task_id}: {str(e)}")
+            logger.error(f"执行case失败: {case.task_id}: {str(e)}", exc_info=True)
             trace = self.collector.end_case(
                 success=False,
                 error=str(e)
             )
             return trace
 
-    def _simulate_execution(self, case: GAIACase, trace: ExecutionTrace) -> bool:
+    def _simulate_execution(self, case: GAIACase, trace: ExecutionTrace) -> tuple[bool, Optional[str]]:
         """
-        模拟执行（用于测试）
+        通过QwenPaw API执行case
         
         Args:
             case: 案例
             trace: 轨迹对象
             
         Returns:
-            是否成功
+            (成功标志, 最终答案)
         """
-        iteration = 1
-        max_iterations = 3 if case.level == 1 else (8 if case.level == 2 else 15)
+        if not self.session:
+            self.setup_session()
         
-        # 记录Turn开始
-        self.collector.record_turn_start(
-            iteration,
-            case.question,
-            len(case.question) * 4
-        )
+        # 准备请求
+        session_id = f"gaia-{case.task_id}"
         
-        time.sleep(0.5)  # 模拟处理时间
+        # 构建消息内容
+        content = []
         
-        # 记录Tool调用（如果有附件）
+        # 添加文本
+        content.append({
+            "type": "text",
+            "text": case.question
+        })
+        
+        # 如果有附件，添加文件
         if case.has_attachment():
-            self.collector.record_tool_call(
-                iteration,
-                "file_reader",
-                {"file_path": case.file_path}
-            )
-            time.sleep(0.2)
-            self.collector.record_tool_result(
-                iteration,
-                "file_reader",
-                "File content extracted",
-                "success"
-            )
+            host_file_path = self.env.dataset_root / case.file_path
+            if host_file_path.exists():
+                logger.info(f"附件存在: {host_file_path}")
+                
+                # 容器内的文件路径（发送给QwenPaw）
+                # 因为挂载是 ../dataset/GAIA:/data/gaia:ro
+                # 需要将Windows路径转换为Unix路径
+                container_file_path = f"/data/gaia/{str(case.file_path).replace(chr(92), '/')}"
+                logger.info(f"容器内路径: {container_file_path}")
+                
+                try:
+                    with open(host_file_path, 'rb') as f:
+                        file_content = f.read()
+                    
+                    logger.info(f"文件大小: {len(file_content)} bytes")
+                    
+                    # 根据文件类型添加
+                    if host_file_path.suffix.lower() in ['.pdf', '.txt', '.md', '.xlsx', '.csv']:
+                        content.append({
+                            "type": "file",
+                            "file_name": host_file_path.name,
+                            "file_path": container_file_path
+                        })
+                        logger.info(f"添加附件: {host_file_path.name}")
+                except Exception as e:
+                    logger.warning(f"处理文件失败: {e}")
+            else:
+                logger.warning(f"附件不存在: {host_file_path}")
         
-        # 记录Turn结束
-        self.collector.record_turn_end(
-            iteration,
-            "Generated response",
-            len(case.question) * 4 + 100,
-            0.7
-        )
+        # 构建请求体
+        request_body = {
+            "input": [
+                {
+                    "role": "user",
+                    "content": content
+                }
+            ],
+            "session_id": session_id
+        }
         
-        return True
+        # 发送请求到QwenPaw API
+        chat_endpoint = f"{self.env.qwenpaw_base_url}/console/chat"
+
+        
+        try:
+            logger.info(f"发送请求到: {chat_endpoint}")
+            logger.info(f"Session ID: {session_id}")
+            logger.info(f"问题: {case.question[:100]}...")
+            
+            response = self.session.post(
+                chat_endpoint,
+                json=request_body,
+                stream=True,
+                timeout=300
+            )
+            
+            if response.status_code != 200:
+                logger.error(f"API返回错误: {response.status_code}")
+                logger.error(f"响应: {response.text}")
+                return False, None
+            
+            # 处理SSE流
+            iteration = 1
+            full_response = ""
+            
+            self.collector.record_turn_start(iteration, case.question, len(json.dumps(request_body)))
+            
+            for line in response.iter_lines():
+                if not line:
+                    continue
+                
+                line = line.decode('utf-8') if isinstance(line, bytes) else line
+                
+                # 处理SSE格式: "data: {...}"
+                if line.startswith('data: '):
+                    try:
+                        event_data = json.loads(line[6:])  # 移除 "data: " 前缀
+                        
+                        # 记录不同类型的事件
+                        if event_data.get('type') == 'text':
+                            full_response += event_data.get('content', '')
+                            logger.debug(f"收到文本块: {event_data.get('content', '')[:100]}")
+                        
+                        elif event_data.get('type') == 'tool_call':
+                            tool_name = event_data.get('tool_name', 'unknown')
+                            tool_args = event_data.get('arguments', {})
+                            self.collector.record_tool_call(
+                                iteration,
+                                tool_name,
+                                tool_args
+                            )
+                            logger.info(f"工具调用: {tool_name}")
+                        
+                        elif event_data.get('type') == 'tool_result':
+                            tool_name = event_data.get('tool_name', 'unknown')
+                            result = event_data.get('result', '')
+                            status = event_data.get('status', 'success')
+                            self.collector.record_tool_result(
+                                iteration,
+                                tool_name,
+                                result,
+                                status
+                            )
+                            logger.info(f"工具结果: {tool_name} - {status}")
+                        
+                        elif event_data.get('type') == 'finish':
+                            logger.info("流式响应完成")
+                        
+                    except json.JSONDecodeError:
+                        logger.debug(f"无法解析SSE数据: {line}")
+                        continue
+            
+            # 记录Turn结束
+            self.collector.record_turn_end(
+                iteration,
+                full_response,
+                len(full_response),
+                response.elapsed.total_seconds() if hasattr(response, 'elapsed') else 0
+            )
+            
+            logger.info(f"收到完整响应，长度: {len(full_response)}")
+            
+            # 检查是否与预期答案匹配（简单的字符串包含检查）
+            expected_answer = case.final_answer.lower()
+            actual_answer = full_response.lower()
+            
+            success = expected_answer in actual_answer or actual_answer in expected_answer
+            
+            return success, full_response
+            
+        except Exception as e:
+            logger.error(f"执行请求失败: {str(e)}", exc_info=True)
+            return False, None
 
     def close(self) -> None:
         """关闭会话"""
