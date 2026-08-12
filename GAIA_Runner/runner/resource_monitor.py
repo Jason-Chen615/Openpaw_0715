@@ -134,6 +134,26 @@ class ResourceMonitor:
                     logger.error(self.error, exc_info=True)
                 time.sleep(1)
     
+    @staticmethod
+    def _parse_memory(memory_str: str) -> float:
+        """解析内存字符串为MB"""
+        memory_str = memory_str.split('/')[0].strip()
+        
+        try:
+            if memory_str.endswith('GiB'):
+                return float(memory_str[:-3]) * 1024
+            elif memory_str.endswith('MiB'):
+                return float(memory_str[:-3])
+            elif memory_str.endswith('KiB'):
+                return float(memory_str[:-3]) / 1024
+            elif memory_str.endswith('B'):
+                return float(memory_str[:-1]) / (1024 * 1024)
+            else:
+                return 0.0
+        except ValueError:
+            return 0.0
+    
+
     
     def save_results(self) -> Dict:
         """保存采集结果为JSON和CSV"""
