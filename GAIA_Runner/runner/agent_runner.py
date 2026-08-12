@@ -199,6 +199,9 @@ class AgentRunner:
                 return False, None
             
             # 处理SSE流
+            # 根据真实payload格式修复，结构为：
+            # - 流式文本块: {"sequence_number":N, "object":"content", "type":"text", "text":"..."}
+            # - 完整消息: {"sequence_number":N, "object":"message", "content":[{"text":"..."}]}
             iteration = 1
             full_response = ""
             
@@ -214,39 +217,71 @@ class AgentRunner:
                 if line.startswith('data: '):
                     try:
                         event_data = json.loads(line[6:])  # 移除 "data: " 前缀
+                        obj_type = event_data.get('object')  # 区分 'content' 和 'message'
                         
-                        # 记录不同类型的事件
-                        if event_data.get('type') == 'text':
-                            full_response += event_data.get('content', '')
-                            logger.debug(f"收到文本块: {event_data.get('content', '')[:100]}")
+                        # ===== 处理流式内容块 (object="content") =====
+                        if obj_type == 'content':
+                            event_type = event_data.get('type')
+                            
+                            # 文本块：直接从 'text' 字段提取（不是 'content'）
+                            if event_type == 'text':
+                                text_chunk = event_data.get('text', '')
+                                if text_chunk:  # 只有非空才追加
+                                    full_response += text_chunk
+                                    logger.debug(f"收到文本块 (delta={event_data.get('delta')}): {text_chunk[:100]}")
+                            
+                            # 工具调用事件
+                            elif event_type == 'tool_call':
+                                tool_name = event_data.get('tool_name', 'unknown')
+                                tool_args = event_data.get('arguments', {})
+                                self.collector.record_tool_call(
+                                    iteration,
+                                    tool_name,
+                                    tool_args
+                                )
+                                logger.info(f"工具调用: {tool_name}")
+                            
+                            # 工具结果事件
+                            elif event_type == 'tool_result':
+                                tool_name = event_data.get('tool_name', 'unknown')
+                                result = event_data.get('result', '')
+                                status = event_data.get('status', 'success')
+                                self.collector.record_tool_result(
+                                    iteration,
+                                    tool_name,
+                                    result,
+                                    status
+                                )
+                                logger.info(f"工具结果: {tool_name} - {status}")
                         
-                        elif event_data.get('type') == 'tool_call':
-                            tool_name = event_data.get('tool_name', 'unknown')
-                            tool_args = event_data.get('arguments', {})
-                            self.collector.record_tool_call(
-                                iteration,
-                                tool_name,
-                                tool_args
-                            )
-                            logger.info(f"工具调用: {tool_name}")
+                        # ===== 处理完整消息 (object="message") =====
+                        elif obj_type == 'message':
+                            msg_type = event_data.get('type')
+                            
+                            if msg_type == 'message':
+                                # 从 content 数组中提取所有文本块
+                                content_list = event_data.get('content', [])
+                                if isinstance(content_list, list):
+                                    for content_item in content_list:
+                                        if isinstance(content_item, dict):
+                                            item_text = content_item.get('text', '')
+                                            if item_text:  # 只有非空才追加
+                                                full_response += item_text
+                                                logger.debug(f"收到完整消息文本块: {item_text[:100]}")
+                            
+                            elif msg_type == 'reasoning':
+                                # reasoning 消息，通常是中间推理过程，可选记录
+                                reasoning_text = event_data.get('text', '')
+                                if reasoning_text:
+                                    logger.debug(f"推理过程: {reasoning_text[:100]}")
                         
-                        elif event_data.get('type') == 'tool_result':
-                            tool_name = event_data.get('tool_name', 'unknown')
-                            result = event_data.get('result', '')
-                            status = event_data.get('status', 'success')
-                            self.collector.record_tool_result(
-                                iteration,
-                                tool_name,
-                                result,
-                                status
-                            )
-                            logger.info(f"工具结果: {tool_name} - {status}")
+                        # ===== 处理响应完成 =====
+                        elif event_data.get('status') == 'completed':
+                            # 某些事件用 status="completed" 标记完成
+                            logger.debug(f"事件标记为完成: {obj_type}")
                         
-                        elif event_data.get('type') == 'finish':
-                            logger.info("流式响应完成")
-                        
-                    except json.JSONDecodeError:
-                        logger.debug(f"无法解析SSE数据: {line}")
+                    except json.JSONDecodeError as e:
+                        logger.debug(f"无法解析SSE数据: {line[:100]}")
                         continue
             
             # 记录Turn结束
