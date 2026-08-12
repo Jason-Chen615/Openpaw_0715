@@ -42,6 +42,7 @@ def main():
     parser.add_argument('--case-id', help='案例ID（可选，不指定则用代表性案例）')
     parser.add_argument('--output-dir', default=OUTPUT_DIR, help='输出目录')
     parser.add_argument('--dataset-root', default=GAIA_DATASET_ROOT, help='数据集根目录')
+    parser.add_argument('--agent-id', default='qwenpaw_gaia', help='QwenPaw Agent ID')
     args = parser.parse_args()
     
     setup_logging(LOG_FILE, LOG_LEVEL)
@@ -51,7 +52,10 @@ def main():
     
     try:
         # 初始化
-        env = ExecutionEnvironment(dataset_root=args.dataset_root)
+        env = ExecutionEnvironment(
+            dataset_root=args.dataset_root,
+            agent_id=args.agent_id
+        )
         loader = GAIACaseLoader(args.dataset_root)
         collector = TraceCollector(args.output_dir)
         runner = AgentRunner(env, collector)

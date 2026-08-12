@@ -44,6 +44,7 @@ def main():
     parser.add_argument('--qwenpaw-url', default=QWENPAW_BASE_URL, help='QwenPaw API URL')
     parser.add_argument('--api-user', default=QWENPAW_API_USER, help='API用户名')
     parser.add_argument('--api-pass', default=QWENPAW_API_PASS, help='API密码')
+    parser.add_argument('--agent-id', default='qwenpaw_gaia', help='QwenPaw Agent ID')
     args = parser.parse_args()
     
     # 设置日志
@@ -60,7 +61,8 @@ def main():
             qwenpaw_base_url=args.qwenpaw_url,
             api_username=args.api_user,
             api_password=args.api_pass,
-            dataset_root=args.dataset_root
+            dataset_root=args.dataset_root,
+            agent_id=args.agent_id
         )
         env.setup_session() if hasattr(env, 'setup_session') else None
         logger.info(f"环境配置: {env.to_dict()}")

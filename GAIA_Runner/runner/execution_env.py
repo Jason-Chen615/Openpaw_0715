@@ -14,7 +14,8 @@ class ExecutionEnvironment:
         qwenpaw_base_url: str = "http://127.0.0.1:8088/api",
         api_username: str = "admin",
         api_password: str = "password",
-        dataset_root: Optional[str] = None
+        dataset_root: Optional[str] = None,
+        agent_id: str = "qwenpaw_gaia"
     ):
         """
         初始化执行环境
@@ -28,11 +29,13 @@ class ExecutionEnvironment:
         self.qwenpaw_base_url = qwenpaw_base_url
         self.api_username = api_username
         self.api_password = api_password
+        self.agent_id = agent_id
         
         # 从环境变量读取，优先级高于参数
         self.qwenpaw_base_url = os.getenv('QWENPAW_BASE_URL', qwenpaw_base_url)
         self.api_username = os.getenv('QWENPAW_API_USER', api_username)
         self.api_password = os.getenv('QWENPAW_API_PASS', api_password)
+        self.agent_id = os.getenv('QWENPAW_AGENT_ID', agent_id)
         
         if dataset_root is None:
             dataset_root = os.getenv('GAIA_DATASET_ROOT', 'dataset/GAIA')
