@@ -7,6 +7,7 @@ import json
 from typing import Optional
 from pathlib import Path
 from .execution_env import ExecutionEnvironment
+from .resource_monitor import ResourceMonitor
 from core.models import GAIACase, ExecutionTrace, EventType
 from core.trace_collector import TraceCollector
 
@@ -71,7 +72,7 @@ class AgentRunner:
 
     def execute_case(self, case: GAIACase) -> ExecutionTrace:
         """
-        执行单个case
+        执行单个case（带资源监控）
         
         Args:
             case: GAIA案例
@@ -84,9 +85,30 @@ class AgentRunner:
         # 开始记录
         trace = self.collector.start_case(case.task_id, case.level, case)
         
+        # 初始化资源监控
+        monitor = ResourceMonitor(
+            container_name='qwenpaw_gaia',
+            case_id=case.task_id,
+            output_dir=Path(self.collector.output_dir) / 'resources'
+        )
+        
         try:
+            # 启动资源监控
+            monitor.start()
+            
             # 执行实际的Agent请求
             success, final_answer = self._simulate_execution(case, trace)
+            
+            # 停止资源监控
+            monitor.stop()
+            
+            # 保存资源监控结果
+            try:
+                resource_stats = monitor.save_results()
+                if monitor.error:
+                    logger.warning(f"资源监控异常（但继续执行）: {monitor.error}")
+            except Exception as e:
+                logger.warning(f"保存资源监控结果失败: {str(e)}")
             
             trace = self.collector.end_case(
                 success=success,
@@ -102,6 +124,9 @@ class AgentRunner:
             return trace
             
         except Exception as e:
+            # 停止资源监控
+            monitor.stop()
+            
             logger.error(f"执行case失败: {case.task_id}: {str(e)}", exc_info=True)
             trace = self.collector.end_case(
                 success=False,
