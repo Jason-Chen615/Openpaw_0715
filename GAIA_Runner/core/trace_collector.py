@@ -13,11 +13,12 @@ from core.models import TraceEvent, EventType, ExecutionTrace, GAIACase
 class TraceCollector:
     """采集和存储执行轨迹"""
 
-    def __init__(self, output_dir: str | Path):
+    def __init__(self, output_dir: str | Path, task_id: Optional[str] = None):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.traces_dir = self.output_dir / "traces"
         self.traces_dir.mkdir(parents=True, exist_ok=True)
+        self.task_id = task_id
         self.current_trace: Optional[ExecutionTrace] = None
         self.all_traces: List[ExecutionTrace] = []
         self.raw_sse_file: Optional[Path] = None  # 原始SSE流文件句柄
@@ -152,7 +153,12 @@ class TraceCollector:
         if self.current_trace is None:
             raise RuntimeError("未启动case记录")
         
-        self.raw_sse_file = self.traces_dir / f"{self.current_trace.case_id}_level{self.current_trace.level}_raw_sse.txt"
+        # 如果task_id存在，保存到output_dir/sse.txt；否则保存到traces_dir
+        if self.task_id:
+            self.raw_sse_file = self.output_dir / "sse.txt"
+        else:
+            self.raw_sse_file = self.traces_dir / f"{self.current_trace.case_id}_level{self.current_trace.level}_raw_sse.txt"
+        
         # 如果文件已存在则覆盖
         with open(self.raw_sse_file, 'w', encoding='utf-8') as f:
             f.write(f"=== Raw SSE Stream for case {self.current_trace.case_id} (Level {self.current_trace.level}) ===\n")

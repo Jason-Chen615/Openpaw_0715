@@ -204,10 +204,16 @@ class ResourceMonitor:
         # 保存为CSV
         csv_path = self.output_dir / f"qwenpaw_gaia_resources_{self.case_id}_{timestamp}.csv"
         with open(csv_path, 'w', newline='', encoding='utf-8') as f:
-            fieldnames = ['timestamp', 'case_id', 'cpu_percent', 'memory_usage', 'memory_percent']
+            fieldnames = ['timestamp', 'iso_timestamp', 'case_id', 'cpu_percent', 'memory_usage', 'memory_percent']
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
-            writer.writerows(self.samples)
+            
+            # 为每个样本添加iso_timestamp
+            for sample in self.samples:
+                sample_with_iso = sample.copy()
+                sample_time = sample.get('timestamp', 0)
+                sample_with_iso['iso_timestamp'] = datetime.fromtimestamp(sample_time).isoformat()
+                writer.writerow(sample_with_iso)
         logger.info(f"资源监控CSV已保存: {csv_path}")
         
         return stats

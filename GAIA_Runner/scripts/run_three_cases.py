@@ -84,6 +84,7 @@ def main():
         runner = AgentRunner(env, collector)
         
         # Ensure the specified agent exists
+        logger.info(f"Agent ID before ensure_agent: {env.agent_id}")
         runner.ensure_agent()
         # 4. 执行案例
         traces = []
